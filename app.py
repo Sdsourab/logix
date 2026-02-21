@@ -1,3 +1,4 @@
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BLOCK 1 ── IMPORTS, CONSTANTS & GLOBAL CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2428,19 +2429,18 @@ class RoutingEngine:
 
 class MapRenderer:
     """
-    Folium-based interactive map renderer for LOGIX v7.0.
-    Requires: pip install folium streamlit-folium
+    Zero-dependency interactive map renderer for LOGIX v7.0.
+    Uses pure Leaflet.js loaded from CDN — no pip packages required.
+    Works on Streamlit Cloud and any browser without any installation.
     """
 
-    DHAKA_CENTER  = [23.7808, 90.4007]
-    DEFAULT_ZOOM  = 12
-    TILE_PROVIDER = "CartoDB dark_matter"
+    DHAKA_CENTER = [23.7808, 90.4007]
+    DEFAULT_ZOOM = 12
 
     COLORS = {
         "hub_open":    "#00ff88",
         "hub_closed":  "#ff3366",
         "route":       "#00cfff",
-        "route_alt":   "#ffbb00",
         "edge_low":    "#2a9d8f",
         "edge_mid":    "#e9c46a",
         "edge_high":   "#e76f51",
@@ -2448,42 +2448,40 @@ class MapRenderer:
         "rider":       "#c084fc",
         "revenue_low": "#1a6b3a",
         "revenue_hi":  "#00ff88",
-        "bg":          "#0a0e1a",
-        "grid":        "#1a2235",
     }
+
+    # ── Shared Leaflet boilerplate ─────────────────────────────────────────────
+    _LEAFLET_HEAD = """
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+      body { margin:0; padding:0; background:#0a0e1a; }
+      #map { width:100%; height:{HEIGHT}px; background:#0a0e1a; }
+      .legend {
+        position:absolute; bottom:20px; left:20px; z-index:1000;
+        background:rgba(10,14,26,0.92); border:1px solid #1e3a5f;
+        border-radius:8px; padding:10px 14px;
+        font-family:monospace; font-size:12px; color:#7dd3fc;
+        line-height:1.7;
+      }
+    </style>
+    """
+
+    _LEAFLET_INIT = """
+    var map = L.map('map', {zoomControl:true, attributionControl:false})
+              .setView([23.7808, 90.4007], 12);
+    L.tileLayer(
+      'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+      {subdomains:'abcd', maxZoom:19}
+    ).addTo(map);
+    """
 
     def __init__(self) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
-        self._folium_available = False
-        self._fl         = None
-        self._fl_plugins = None
-        try:
-            import folium as _fl
-            import folium.plugins as _fl_plugins
-            self._fl         = _fl
-            self._fl_plugins = _fl_plugins
-            self._folium_available = True
-            self.logger.info("folium ready")
-        except ImportError:
-            self.logger.warning("folium not installed. Run: pip install folium streamlit-folium")
+        # Always available — pure JS, no Python deps
+        self._folium_available = True
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    def _base_map(self, zoom: int = 12) -> Any:
-        m = self._fl.Map(
-            location      = self.DHAKA_CENTER,
-            zoom_start    = zoom,
-            tiles         = self.TILE_PROVIDER,
-            prefer_canvas = True,
-            control_scale = True,
-        )
-        return m
-
-    def _unavailable_map(self) -> None:
-        st.warning(
-            "**folium** is not installed. Maps are unavailable.\n\n"
-            "Install with: `pip install folium streamlit-folium`"
-        )
+    # ── Internal colour helpers ───────────────────────────────────────────────
 
     @staticmethod
     def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
@@ -2501,178 +2499,122 @@ class MapRenderer:
 
     @staticmethod
     def _traffic_color(traffic: float) -> str:
-        if traffic < 1.3:
-            return MapRenderer.COLORS["edge_low"]
-        if traffic < 1.6:
-            return MapRenderer.COLORS["edge_mid"]
+        if traffic < 1.3:  return MapRenderer.COLORS["edge_low"]
+        if traffic < 1.6:  return MapRenderer.COLORS["edge_mid"]
         return MapRenderer.COLORS["edge_high"]
 
     @staticmethod
     def _traffic_label(traffic: float) -> str:
-        if traffic < 1.3:
-            return "Low"
-        if traffic < 1.6:
-            return "Moderate"
+        if traffic < 1.3:  return "Low"
+        if traffic < 1.6:  return "Moderate"
         return "Heavy"
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    def _wrap_html(self, js_body: str, legend_html: str, height: int = 540) -> str:
+        """Wrap JS drawing code inside a complete self-contained HTML document."""
+        head = self._LEAFLET_HEAD.replace("{HEIGHT}", str(height))
+        return f"""<!DOCTYPE html><html><head>{head}</head><body>
+<div id="map"></div>
+<div class="legend">{legend_html}</div>
+<script>
+{self._LEAFLET_INIT}
+{js_body}
+</script>
+</body></html>"""
+
+    # ── Public API — each method returns an HTML string ───────────────────────
 
     def render_hub_map(
         self,
         hub_metrics:  List[Dict],
         route_result: Optional[Dict]      = None,
         closed_hubs:  Optional[List[str]] = None,
-    ) -> Any:
-        if not self._folium_available:
-            self._unavailable_map()
-            return None
+    ) -> str:
+        closed        = set(closed_hubs or [])
+        metric_by_hub = {hm["hub"]: hm for hm in hub_metrics}
+        js_lines: List[str] = []
 
-        fl     = self._fl
-        m      = self._base_map(zoom=12)
-        closed = set(closed_hubs or [])
-
-        # Layer 1: hub edges
-        edge_layer = fl.FeatureGroup(name="Hub Edges", show=True)
+        # ── Hub edges ─────────────────────────────────────────────────────────
         for hub_a, hub_b, km, traffic in HUB_EDGES:
             if hub_a not in DHAKA_HUBS or hub_b not in DHAKA_HUBS:
                 continue
-            color   = self._traffic_color(traffic)
-            t_label = self._traffic_label(traffic)
-            fl.PolyLine(
-                locations = [list(DHAKA_HUBS[hub_a]), list(DHAKA_HUBS[hub_b])],
-                color     = color,
-                weight    = 2.5,
-                opacity   = 0.75,
-                tooltip   = (
-                    f"<b>{hub_a} to {hub_b}</b><br>"
-                    f"Distance: {km} km<br>"
-                    f"Traffic: x{traffic} ({t_label})"
-                ),
-            ).add_to(edge_layer)
-        edge_layer.add_to(m)
+            la, lo_a = DHAKA_HUBS[hub_a]
+            lb, lo_b = DHAKA_HUBS[hub_b]
+            color    = self._traffic_color(traffic)
+            label    = self._traffic_label(traffic)
+            js_lines.append(
+                f"L.polyline([[{la},{lo_a}],[{lb},{lo_b}]],{{color:'{color}',"
+                f"weight:2.5,opacity:0.75}}).bindTooltip("
+                f"'<b>{hub_a} → {hub_b}</b><br>{km} km · {label} traffic').addTo(map);"
+            )
 
-        # Layer 2: active route overlay
+        # ── Active route overlay ──────────────────────────────────────────────
         if route_result and "path" in route_result and len(route_result["path"]) >= 2:
-            path_coords = [
-                list(DHAKA_HUBS[h])
-                for h in route_result["path"]
-                if h in DHAKA_HUBS
+            coords = [
+                f"[{DHAKA_HUBS[h][0]},{DHAKA_HUBS[h][1]}]"
+                for h in route_result["path"] if h in DHAKA_HUBS
             ]
-            if len(path_coords) >= 2:
-                route_layer = fl.FeatureGroup(name="Active Route", show=True)
-                fl.PolyLine(
-                    locations  = path_coords,
-                    color      = self.COLORS["route"],
-                    weight     = 5,
-                    opacity    = 0.95,
-                    dash_array = "10 6",
-                    tooltip    = (
-                        f"<b>Optimal Route</b><br>"
-                        f"Path: {' > '.join(route_result.get('path', []))}<br>"
-                        f"Dist: {route_result.get('total_km', '?')} km<br>"
-                        f"ETA: {route_result.get('eta_min', '?')} min"
-                    ),
-                ).add_to(route_layer)
-                try:
-                    self._fl_plugins.AntPath(
-                        locations   = path_coords,
-                        color       = self.COLORS["route"],
-                        weight      = 4,
-                        delay       = 800,
-                        pulse_color = "#ffffff",
-                    ).add_to(route_layer)
-                except Exception:
-                    pass
-                for coord in [path_coords[0], path_coords[-1]]:
-                    fl.CircleMarker(
-                        location     = coord,
-                        radius       = 10,
-                        color        = self.COLORS["route"],
-                        fill         = True,
-                        fill_color   = "#ffffff",
-                        fill_opacity = 0.95,
-                    ).add_to(route_layer)
-                route_layer.add_to(m)
+            if len(coords) >= 2:
+                path_str  = ",".join(coords)
+                km_r      = route_result.get("total_km", "?")
+                eta_r     = route_result.get("eta_min", "?")
+                c         = self.COLORS["route"]
+                path_label = " → ".join(route_result["path"])
+                js_lines.append(
+                    f"L.polyline([{path_str}],{{color:'{c}',weight:5,opacity:0.95,"
+                    f"dashArray:'10 6'}}).bindTooltip('<b>Optimal Route</b><br>"
+                    f"{path_label}<br>{km_r} km · {eta_r} min').addTo(map);"
+                )
+                # Endpoint markers
+                for coord in [coords[0], coords[-1]]:
+                    js_lines.append(
+                        f"L.circleMarker({coord},{{radius:9,color:'{c}',"
+                        f"fillColor:'#fff',fillOpacity:0.9,weight:2}}).addTo(map);"
+                    )
 
-        # Layer 3: hub markers
-        hub_layer     = fl.FeatureGroup(name="Hubs", show=True)
-        metric_by_hub = {hm["hub"]: hm for hm in hub_metrics}
-
+        # ── Hub circle markers ────────────────────────────────────────────────
         for hub_name, (lat, lon) in DHAKA_HUBS.items():
             hm         = metric_by_hub.get(hub_name, {})
             is_closed  = hub_name in closed
             centrality = hm.get("centrality", 0.3)
             degree     = hm.get("degree", 2)
             radius     = max(9, min(int(10 + centrality * 20), 26))
-            fill_color = self.COLORS["hub_closed"] if is_closed else self.COLORS["hub_open"]
-            status_txt = "CLOSED" if is_closed else "OPEN"
-
-            popup_html = (
-                "<div style='font-family:monospace;min-width:160px;'>"
-                f"<b>{hub_name}</b><br>"
-                f"<span style='color:{fill_color};'>{status_txt}</span><br>"
-                f"Betweenness: <b>{centrality:.4f}</b><br>"
-                f"Connections: <b>{degree}</b><br>"
-                f"{lat:.4f}N, {lon:.4f}E"
-                "</div>"
+            color      = self.COLORS["hub_closed"] if is_closed else self.COLORS["hub_open"]
+            status     = "CLOSED" if is_closed else "OPEN"
+            popup      = (
+                f"<b>{hub_name}</b><br><span style='color:{color}'>{status}</span><br>"
+                f"Centrality: {centrality:.4f}<br>Connections: {degree}<br>"
+                f"{lat:.4f}N {lon:.4f}E"
             )
-            fl.CircleMarker(
-                location     = [lat, lon],
-                radius       = radius,
-                color        = fill_color,
-                weight       = 2,
-                fill         = True,
-                fill_color   = fill_color,
-                fill_opacity = 0.80,
-                popup        = fl.Popup(popup_html, max_width=220),
-                tooltip      = f"<b>{hub_name}</b> [{status_txt}] | centrality: {centrality:.3f}",
-            ).add_to(hub_layer)
-            fl.Marker(
-                location = [lat + 0.0015, lon],
-                icon     = fl.DivIcon(
-                    html=(
-                        "<div style='font-family:monospace;font-size:10px;"
-                        f"font-weight:700;color:{fill_color};"
-                        "text-shadow:0 0 4px #000;white-space:nowrap;'>"
-                        f"{'X ' if is_closed else ''}{hub_name}</div>"
-                    ),
-                    icon_size   = (100, 16),
-                    icon_anchor = (50, 8),
-                ),
-            ).add_to(hub_layer)
+            js_lines.append(
+                f"L.circleMarker([{lat},{lon}],{{radius:{radius},color:'{color}',"
+                f"fillColor:'{color}',fillOpacity:0.80,weight:2}})"
+                f".bindPopup('{popup}')"
+                f".bindTooltip('<b>{hub_name}</b> [{status}] centrality:{centrality:.3f}').addTo(map);"
+            )
+            js_lines.append(
+                f"L.marker([{lat+0.0015},{lon}],{{icon:L.divIcon({{html:"
+                f"\"<div style='font-family:monospace;font-size:10px;font-weight:700;"
+                f"color:{color};text-shadow:0 0 4px #000;text-align:center;"
+                f"white-space:nowrap'>{hub_name}</div>\","
+                f"iconSize:[100,16],iconAnchor:[50,8]}})  }}).addTo(map);"
+            )
 
-        hub_layer.add_to(m)
-        fl.LayerControl(collapsed=False).add_to(m)
-
-        legend_html = (
-            "<div style='position:fixed;bottom:30px;left:30px;z-index:1000;"
-            "background:rgba(10,14,26,0.90);border:1px solid #1e3a5f;"
-            "border-radius:8px;padding:10px 14px;font-family:monospace;"
-            "font-size:12px;color:#7dd3fc;'>"
+        legend = (
             "<b>Hub Network</b><br>"
-            f"<span style='color:{self.COLORS['hub_open']}'>Open hub</span><br>"
-            f"<span style='color:{self.COLORS['hub_closed']}'>Closed hub</span><br>"
-            f"<span style='color:{self.COLORS['edge_low']}'>Low traffic</span><br>"
-            f"<span style='color:{self.COLORS['edge_mid']}'>Moderate traffic</span><br>"
-            f"<span style='color:{self.COLORS['edge_high']}'>Heavy traffic</span>"
-            "</div>"
+            f"<span style='color:{self.COLORS['hub_open']}'>● Open hub</span><br>"
+            f"<span style='color:{self.COLORS['hub_closed']}'>● Closed hub</span><br>"
+            f"<span style='color:{self.COLORS['edge_low']}'>━ Low traffic</span><br>"
+            f"<span style='color:{self.COLORS['edge_mid']}'>━ Moderate</span><br>"
+            f"<span style='color:{self.COLORS['edge_high']}'>━ Heavy</span>"
         )
-        m.get_root().html.add_child(fl.Element(legend_html))
-        return m
+        return self._wrap_html("\n".join(js_lines), legend, height=540)
 
     def render_demand_bubbles(
         self,
         inventory: List[Dict],
         forecasts: Dict[str, Dict],
         prices:    Dict[str, Dict],
-    ) -> Any:
-        if not self._folium_available:
-            self._unavailable_map()
-            return None
-
-        fl = self._fl
-        m  = self._base_map(zoom=12)
-
+    ) -> str:
         zone_demand:  Dict[str, float]     = {}
         zone_details: Dict[str, List[str]] = {}
 
@@ -2688,83 +2630,54 @@ class MapRenderer:
                 price = prices.get(sid, {}).get("price", 50) or 50
                 val   = avg_d * price * seed_r.uniform(0.65, 1.35)
                 total += val
-                details.append(f"{name}: {avg_d:.1f} u/day x {price:.0f}")
+                details.append(f"{name}: {avg_d:.1f} u/day × {price:.0f}")
             zone_demand[hub]  = total
             zone_details[hub] = details
 
-        max_demand   = max(zone_demand.values()) or 1.0
-        bubble_layer = fl.FeatureGroup(name="Demand Bubbles", show=True)
+        max_demand = max(zone_demand.values()) or 1.0
+        js_lines: List[str] = []
 
         for hub_name, (lat, lon) in DHAKA_HUBS.items():
             demand = zone_demand.get(hub_name, 0)
             ratio  = demand / max_demand
             radius       = max(12, min(int(15 + ratio * 50), 65))
-            fill_opacity = 0.20 + ratio * 0.55
+            fill_opacity = round(0.20 + ratio * 0.55, 2)
             color        = self._interpolate_color(ratio, "#7b2d00", self.COLORS["bubble"])
-
-            detail_lines = "<br>".join(zone_details.get(hub_name, []))
-            popup_html   = (
-                "<div style='font-family:monospace;min-width:200px;'>"
+            detail_lines = " | ".join(zone_details.get(hub_name, []))
+            popup        = (
                 f"<b>{hub_name}</b><br>"
-                f"<b style='color:{self.COLORS['bubble']};'>Demand: {demand:,.0f}</b> "
-                f"({ratio*100:.1f}% of peak)<br><hr>{detail_lines}</div>"
+                f"<b style='color:{self.COLORS['bubble']}'>Demand: {demand:,.0f}</b> "
+                f"({ratio*100:.1f}% of peak)<br><small>{detail_lines}</small>"
             )
-            fl.CircleMarker(
-                location     = [lat, lon],
-                radius       = radius + 10,
-                color        = color,
-                weight       = 1,
-                fill         = True,
-                fill_color   = color,
-                fill_opacity = 0.06,
-            ).add_to(bubble_layer)
-            fl.CircleMarker(
-                location     = [lat, lon],
-                radius       = radius,
-                color        = color,
-                weight       = 2,
-                fill         = True,
-                fill_color   = color,
-                fill_opacity = fill_opacity,
-                popup        = fl.Popup(popup_html, max_width=260),
-                tooltip      = f"<b>{hub_name}</b> | Demand: {demand:,.0f} ({ratio*100:.1f}%)",
-            ).add_to(bubble_layer)
-            fl.Marker(
-                location = [lat + 0.0018, lon],
-                icon     = fl.DivIcon(
-                    html=(
-                        "<div style='font-family:monospace;font-size:10px;font-weight:700;"
-                        f"color:{color};text-shadow:0 0 4px #000;white-space:nowrap;"
-                        f"text-align:center;'>{hub_name}</div>"
-                    ),
-                    icon_size   = (100, 16),
-                    icon_anchor = (50, 8),
-                ),
-            ).add_to(bubble_layer)
+            # Outer glow ring
+            js_lines.append(
+                f"L.circleMarker([{lat},{lon}],{{radius:{radius+10},color:'{color}',"
+                f"fillColor:'{color}',fillOpacity:0.06,weight:1}}).addTo(map);"
+            )
+            # Main bubble
+            js_lines.append(
+                f"L.circleMarker([{lat},{lon}],{{radius:{radius},color:'{color}',"
+                f"fillColor:'{color}',fillOpacity:{fill_opacity},weight:2}})"
+                f".bindPopup(\"{popup}\")"
+                f".bindTooltip('<b>{hub_name}</b> | Demand: {demand:,.0f} ({ratio*100:.1f}%)').addTo(map);"
+            )
+            # Label
+            js_lines.append(
+                f"L.marker([{lat+0.0018},{lon}],{{icon:L.divIcon({{html:"
+                f"\"<div style='font-family:monospace;font-size:10px;font-weight:700;"
+                f"color:{color};text-shadow:0 0 4px #000;text-align:center;"
+                f"white-space:nowrap'>{hub_name}</div>\","
+                f"iconSize:[100,16],iconAnchor:[50,8]}})  }}).addTo(map);"
+            )
 
-        bubble_layer.add_to(m)
-        fl.LayerControl(collapsed=False).add_to(m)
-
-        legend_html = (
-            "<div style='position:fixed;bottom:30px;left:30px;z-index:1000;"
-            "background:rgba(10,14,26,0.90);border:1px solid #1e3a5f;"
-            "border-radius:8px;padding:10px 14px;font-family:monospace;"
-            "font-size:12px;color:#7dd3fc;'>"
+        legend = (
             "<b>Demand Bubble Map</b><br>"
             f"<span style='color:{self.COLORS['bubble']}'>Large + bright = high demand</span><br>"
             "<i>Click bubble for SKU breakdown</i>"
-            "</div>"
         )
-        m.get_root().html.add_child(fl.Element(legend_html))
-        return m
+        return self._wrap_html("\n".join(js_lines), legend, height=520)
 
-    def render_rider_map(self, orders: List[Dict]) -> Any:
-        if not self._folium_available:
-            self._unavailable_map()
-            return None
-
-        fl        = self._fl
-        m         = self._base_map(zoom=12)
+    def render_rider_map(self, orders: List[Dict]) -> str:
         zone_cnt: Dict[str, int]   = defaultdict(int)
         zone_rev: Dict[str, float] = defaultdict(float)
 
@@ -2777,74 +2690,46 @@ class MapRenderer:
             for h in DHAKA_HUBS:
                 zone_cnt[h] = 0
 
-        max_cnt      = max(zone_cnt.values()) or 1
-        color        = self.COLORS["rider"]
-        rider_layer  = fl.FeatureGroup(name="Rider Distribution", show=True)
+        max_cnt    = max(zone_cnt.values()) or 1
+        color      = self.COLORS["rider"]
+        js_lines: List[str] = []
 
         for hub_name, (lat, lon) in DHAKA_HUBS.items():
             cnt     = zone_cnt.get(hub_name, 0)
             rev     = zone_rev.get(hub_name, 0.0)
             ratio   = cnt / max_cnt
             radius  = max(8, min(int(10 + ratio * 35), 48))
-            opacity = 0.35 + ratio * 0.50
-
-            popup_html = (
-                "<div style='font-family:monospace;'>"
-                f"<b>{hub_name}</b><br>"
-                f"Orders: <b>{cnt}</b><br>"
-                f"Revenue: <b>{rev:,.0f}</b>"
-                "</div>"
+            opacity = round(0.35 + ratio * 0.50, 2)
+            popup   = (
+                f"<b>{hub_name}</b><br>Orders: <b>{cnt}</b><br>"
+                f"Revenue: <b>৳{rev:,.0f}</b>"
             )
-            fl.CircleMarker(
-                location     = [lat, lon],
-                radius       = radius,
-                color        = color,
-                weight       = 2,
-                fill         = True,
-                fill_color   = color,
-                fill_opacity = opacity,
-                popup        = fl.Popup(popup_html, max_width=200),
-                tooltip      = f"<b>{hub_name}</b> | {cnt} orders | {rev:,.0f}",
-            ).add_to(rider_layer)
-            fl.Marker(
-                location = [lat + 0.0016, lon],
-                icon     = fl.DivIcon(
-                    html=(
-                        "<div style='font-family:monospace;font-size:10px;font-weight:700;"
-                        f"color:{color};text-shadow:0 0 4px #000;white-space:nowrap;"
-                        f"text-align:center;'>{hub_name} ({cnt})</div>"
-                    ),
-                    icon_size   = (120, 16),
-                    icon_anchor = (60, 8),
-                ),
-            ).add_to(rider_layer)
+            js_lines.append(
+                f"L.circleMarker([{lat},{lon}],{{radius:{radius},color:'{color}',"
+                f"fillColor:'{color}',fillOpacity:{opacity},weight:2}})"
+                f".bindPopup('{popup}')"
+                f".bindTooltip('<b>{hub_name}</b> | {cnt} orders | ৳{rev:,.0f}').addTo(map);"
+            )
+            js_lines.append(
+                f"L.marker([{lat+0.0016},{lon}],{{icon:L.divIcon({{html:"
+                f"\"<div style='font-family:monospace;font-size:10px;font-weight:700;"
+                f"color:{color};text-shadow:0 0 4px #000;text-align:center;"
+                f"white-space:nowrap'>{hub_name} ({cnt})</div>\","
+                f"iconSize:[120,16],iconAnchor:[60,8]}})  }}).addTo(map);"
+            )
 
-        rider_layer.add_to(m)
-        fl.LayerControl(collapsed=False).add_to(m)
-
-        legend_html = (
-            "<div style='position:fixed;bottom:30px;left:30px;z-index:1000;"
-            "background:rgba(10,14,26,0.90);border:1px solid #1e3a5f;"
-            "border-radius:8px;padding:10px 14px;font-family:monospace;"
-            "font-size:12px;color:#7dd3fc;'>"
+        legend = (
             "<b>Rider Distribution</b><br>"
-            f"<span style='color:{color}'>Circle size = order count per zone</span>"
-            "</div>"
+            f"<span style='color:{color}'>Circle size ∝ order count</span>"
         )
-        m.get_root().html.add_child(fl.Element(legend_html))
-        return m
+        return self._wrap_html("\n".join(js_lines), legend, height=500)
 
-    def render_zone_revenue(self, zone_stats: List[Dict]) -> Any:
-        if not self._folium_available:
-            self._unavailable_map()
-            return None
+    def render_zone_revenue(self, zone_stats: List[Dict]) -> str:
         if not zone_stats:
             return self.render_rider_map([])
 
-        fl      = self._fl
-        m       = self._base_map(zoom=12)
-        max_rev = max((z.get("revenue") or 0) for z in zone_stats) or 1.0
-        rev_layer = fl.FeatureGroup(name="Zone Revenue", show=True)
+        max_rev   = max((z.get("revenue") or 0) for z in zone_stats) or 1.0
+        js_lines: List[str] = []
 
         for z in zone_stats:
             zone_name = z.get("zone", "?")
@@ -2858,55 +2743,36 @@ class MapRenderer:
             color    = self._interpolate_color(
                 ratio, self.COLORS["revenue_low"], self.COLORS["revenue_hi"]
             )
-            opacity  = 0.40 + ratio * 0.45
-
-            popup_html = (
-                "<div style='font-family:monospace;'>"
+            opacity  = round(0.40 + ratio * 0.45, 2)
+            popup    = (
                 f"<b>{zone_name}</b><br>"
-                f"Revenue: <b style='color:{color};'>{revenue:,.0f}</b><br>"
+                f"Revenue: <b style='color:{color}'>৳{revenue:,.0f}</b><br>"
                 f"Orders: <b>{orders}</b>"
-                "</div>"
             )
-            fl.CircleMarker(
-                location     = [lat, lon],
-                radius       = radius,
-                color        = color,
-                weight       = 2,
-                fill         = True,
-                fill_color   = color,
-                fill_opacity = opacity,
-                popup        = fl.Popup(popup_html, max_width=200),
-                tooltip      = f"<b>{zone_name}</b> | {revenue:,.0f} ({orders} orders)",
-            ).add_to(rev_layer)
-            fl.Marker(
-                location = [lat + 0.0016, lon],
-                icon     = fl.DivIcon(
-                    html=(
-                        "<div style='font-family:monospace;font-size:10px;font-weight:700;"
-                        f"color:{color};text-shadow:0 0 4px #000;white-space:nowrap;"
-                        f"text-align:center;'>{zone_name}</div>"
-                    ),
-                    icon_size   = (110, 16),
-                    icon_anchor = (55, 8),
-                ),
-            ).add_to(rev_layer)
+            js_lines.append(
+                f"L.circleMarker([{lat},{lon}],{{radius:{radius},color:'{color}',"
+                f"fillColor:'{color}',fillOpacity:{opacity},weight:2}})"
+                f".bindPopup('{popup}')"
+                f".bindTooltip('<b>{zone_name}</b> | ৳{revenue:,.0f} ({orders} orders)').addTo(map);"
+            )
+            js_lines.append(
+                f"L.marker([{lat+0.0016},{lon}],{{icon:L.divIcon({{html:"
+                f"\"<div style='font-family:monospace;font-size:10px;font-weight:700;"
+                f"color:{color};text-shadow:0 0 4px #000;text-align:center;"
+                f"white-space:nowrap'>{zone_name}</div>\","
+                f"iconSize:[110,16],iconAnchor:[55,8]}})  }}).addTo(map);"
+            )
 
-        rev_layer.add_to(m)
-        fl.LayerControl(collapsed=False).add_to(m)
-
-        legend_html = (
-            "<div style='position:fixed;bottom:30px;left:30px;z-index:1000;"
-            "background:rgba(10,14,26,0.90);border:1px solid #1e3a5f;"
-            "border-radius:8px;padding:10px 14px;font-family:monospace;"
-            "font-size:12px;color:#7dd3fc;'>"
+        legend = (
             "<b>Zone Revenue</b><br>"
             f"<span style='color:{self.COLORS['revenue_hi']}'>Bright = high revenue</span><br>"
             f"<span style='color:{self.COLORS['revenue_low']}'>Dark = low revenue</span>"
-            "</div>"
         )
-        m.get_root().html.add_child(fl.Element(legend_html))
-        return m
+        return self._wrap_html("\n".join(js_lines), legend, height=500)
 
+    # ── Legacy shim so nothing else needs changing ────────────────────────────
+    def _unavailable_map(self) -> None:
+        pass  # never called — always available
 # ═══════════════════════════════════════════════════════════════════════════════
 # BLOCK 7 ── PRESENTATION LAYER (NEXUS UI)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3103,8 +2969,8 @@ class NexusUI:
     def _sidebar(self) -> None:
         with st.sidebar:
             st.markdown(
-                "<h2 style='color:#00ff88;letter-spacing:1px;'>LOGIX</h2>"
-                "<p style='color:#7dd3fc;font-size:.78rem;margin-top:0;'>developed by Sourab Dey Soptom </p>",
+                "<h2 style='color:#00ff88;letter-spacing:1px;'>🚀 LOGIX v7.0</h2>"
+                "<p style='color:#7dd3fc;font-size:.78rem;margin-top:0;'>Chaldal Supply Chain Intelligence</p>",
                 unsafe_allow_html=True,
             )
             # Data source badge
@@ -3612,223 +3478,168 @@ class NexusUI:
     # ═════════════════════════════════════════════════════════════════════════
 
     def _t4_map(self, inv: List[Dict], prices: Dict, fcs: Dict) -> None:
-            st.markdown("## 🗺️ Live Delivery Map ")
+        st.markdown("## 🗺️ Live Delivery Map — OpenStreetMap + Leaflet.js")
+        st.caption("Zero-dependency interactive maps — no extra packages required.")
 
-            # ── Dependency check ──────────────────────────────────────────────────
-            try:
-                from streamlit_folium import st_folium  # type: ignore
-                _sf_available = True
-            except ImportError:
-                _sf_available = False
+        t_hub, t_route, t_bubble, t_rider = st.tabs([
+            "🌐 Hub Network", "🛣️ Route Planner",
+            "🫧 Demand Bubbles", "🏍️ Riders & Revenue",
+        ])
 
-            if not _sf_available or not self.maps._folium_available:
-                st.error(
-                    "**streamlit-folium** or **folium** is not installed.\n\n"
-                    "Install both with:\n```\npip install folium streamlit-folium\n```\n\n"
-                    "Then restart the Streamlit server."
+        hub_metrics = self.routing.get_hub_metrics()
+        closed_hubs = self.routing.get_closed_hubs()
+
+        # ── Tab: Hub Network ──────────────────────────────────────────────────
+        with t_hub:
+            st.markdown("### Hub Network Map")
+            st.caption(
+                "Node size ∝ betweenness centrality. "
+                "Edge colour: 🟢 low / 🟡 moderate / 🔴 heavy traffic."
+            )
+            col_ctrl, col_map = st.columns([1, 3])
+
+            with col_ctrl:
+                st.markdown("**🔴 Close Hub**")
+                close_h = st.selectbox(
+                    "Hub to close", ["— none —"] + list(DHAKA_HUBS.keys()), key="cl_hub"
                 )
-                return
-
-            t_hub, t_route, t_bubble, t_rider = st.tabs([
-                "🌐 Hub Network", "🛣️ Route Planner",
-                "🫧 Demand Bubbles", "🏍️ Riders & Revenue",
-            ])
-
-            hub_metrics = self.routing.get_hub_metrics()
-            closed_hubs = self.routing.get_closed_hubs()
-
-            # ── Tab: Hub Network ──────────────────────────────────────────────────
-            with t_hub:
-                st.markdown("### Hub Network Map")
-                st.caption(
-                    "Node size ∝ betweenness centrality. "
-                    "Edge colour: 🟢 low / 🟡 moderate / 🔴 heavy traffic."
-                )
-                col_ctrl, col_map = st.columns([1, 3])
-
-                with col_ctrl:
-                    st.markdown("**🔴 Close Hub**")
-                    close_h = st.selectbox(
-                        "Hub to close", ["— none —"] + list(DHAKA_HUBS.keys()), key="cl_hub"
+                if st.button("Close", key="cl_btn") and close_h != "— none —":
+                    self.routing.close_hub(close_h)
+                    self.db.add_alert(
+                        "critical", "Logistics", f"Hub {close_h} CLOSED by operator."
                     )
-                    if st.button("Close", key="cl_btn") and close_h != "— none —":
-                        self.routing.close_hub(close_h)
-                        self.db.add_alert(
-                            "critical", "Logistics", f"Hub {close_h} CLOSED by operator."
-                        )
-                        st.rerun()
+                    st.rerun()
 
-                    st.markdown("**🟢 Reopen Hub**")
-                    open_opts = closed_hubs if closed_hubs else ["— none —"]
-                    open_h    = st.selectbox("Hub to reopen", open_opts, key="op_hub")
-                    if st.button("Reopen", key="op_btn") and closed_hubs:
-                        self.routing.reopen_hub(open_h)
-                        st.rerun()
+                st.markdown("**🟢 Reopen Hub**")
+                open_opts = closed_hubs if closed_hubs else ["— none —"]
+                open_h    = st.selectbox("Hub to reopen", open_opts, key="op_hub")
+                if st.button("Reopen", key="op_btn") and closed_hubs:
+                    self.routing.reopen_hub(open_h)
+                    st.rerun()
 
-                    if closed_hubs:
-                        st.error(f"Closed: {', '.join(closed_hubs)}")
-                    else:
-                        st.success("All hubs operational")
-
-                    st.divider()
-                    st.markdown("**Hub Metrics**")
-                    for hm in hub_metrics:
-                        status_icon = "🔴" if hm["hub"] in closed_hubs else "🟢"
-                        st.markdown(
-                            f'<div class="sb-metric">{status_icon} <b>{hm["hub"]}</b><br>'
-                            f'Centrality: {hm.get("centrality", 0):.3f} | '
-                            f'Degree: {hm.get("degree", 0)}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                with col_map:
-                    route_state  = st.session_state.get("last_route")
-                    hub_folium_m = self.maps.render_hub_map(
-                        hub_metrics, route_state, closed_hubs
-                    )
-                    if hub_folium_m is not None:
-                        st_folium(
-                            hub_folium_m,
-                            width            = "100%",
-                            height           = 540,
-                            returned_objects = [],
-                            key              = "hub_map",
-                        )
-
-            # ── Tab: Route Planner ────────────────────────────────────────────────
-            with t_route:
-                st.markdown("### 🛣️ Optimal Route Planner")
-                hubs       = list(DHAKA_HUBS.keys())
-                r1, r2, r3 = st.columns(3)
-                with r1: src  = st.selectbox("Origin",          hubs,        key="r_src")
-                with r2: dst  = st.selectbox("Destination",     hubs, index=3, key="r_dst")
-                with r3: mode = st.radio(
-                    "Optimise for", ["balanced", "distance", "time"],
-                    horizontal=True, key="r_mode",
-                )
-
-                if st.button("🔍 Find Route", key="r_btn"):
-                    if src == dst:
-                        st.warning("Origin and destination must be different hubs.")
-                    else:
-                        result = self.routing.find_optimal_route(src, dst, mode=mode)
-                        if "error" not in result:
-                            st.session_state["last_route"] = result
-                            c1, c2, c3, c4 = st.columns(4)
-                            c1.metric("Distance",  f'{result["total_km"]} km')
-                            c2.metric("ETA",       f'{result["eta_min"]} min')
-                            c3.metric("Hops",       result["hops"])
-                            c4.metric("CO₂ Saved", f'{result.get("co2_saving_kg", 0):.3f} kg')
-                            st.success(f"Route: **{' → '.join(result['path'])}**")
-                            savings = self.business.calculate_carbon_savings(
-                                result.get("traditional_km", result["total_km"] * 1.3),
-                                result["total_km"],
-                            )
-                            self.db.log_carbon(
-                                f"{src}_{dst}_{int(time.time())}",
-                                result.get("traditional_km", result["total_km"] * 1.3),
-                                result["total_km"],
-                                savings["fuel_saved"],
-                                savings["co2_saved"],
-                                savings["cost_saved"],
-                            )
-                            st.info(
-                                f"💚 Saved: {savings['km_saved']:.2f} km | "
-                                f"৳{savings['cost_saved']:.0f} | "
-                                f"{savings['co2_saved']:.3f} kg CO₂"
-                            )
-                            st.rerun()
-                        else:
-                            st.error(result["error"])
-
-                # Route map (always shows last computed route)
-                if st.session_state.get("last_route"):
-                    st.markdown("**Optimal route visualised:**")
-                    route_folium_m = self.maps.render_hub_map(
-                        hub_metrics,
-                        st.session_state["last_route"],
-                        closed_hubs,
-                    )
-                    if route_folium_m is not None:
-                        st_folium(
-                            route_folium_m,
-                            width            = "100%",
-                            height           = 460,
-                            returned_objects = [],
-                            key              = "route_map",
-                        )
+                if closed_hubs:
+                    st.error(f"Closed: {', '.join(closed_hubs)}")
+                else:
+                    st.success("All hubs operational")
 
                 st.divider()
-                st.markdown("### 🔄 Multi-Stop Route Planner")
-                mh = st.multiselect(
-                    "Select Hubs (min 2)", hubs, default=hubs[:4], key="mh"
-                )
-                if st.button("📍 Plan Multi-Stop", key="ms_btn") and len(mh) >= 2:
-                    plan = self.routing.plan_multi_stop(mh, optimize=True)
-                    if "error" not in plan:
-                        st.success(f"Route: {' → '.join(plan['route_order'])}")
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Total km",   f'{plan["total_km"]} km')
-                        c2.metric("Total ETA",  f'{plan["total_eta_min"]} min')
-                        c3.metric("CO₂ Saved",  f'{plan["total_co2_kg"]:.3f} kg')
-                    else:
-                        st.error(plan["error"])
-
-            # ── Tab: Demand Bubbles ───────────────────────────────────────────────
-            with t_bubble:
-                st.markdown("### 🫧 Zone Demand Bubble Map")
-                st.caption(
-                    "Bubble radius and brightness ∝ weighted demand index "
-                    "(avg 7-day forecast × live price × zone variance). "
-                    "Click a bubble for the per-SKU breakdown."
-                )
-                fc_map = fcs if fcs else {
-                    i.get("sku_id", ""): {"forecast": [50] * FORECAST_DAYS} for i in inv
-                }
-                bubble_folium_m = self.maps.render_demand_bubbles(inv, fc_map, prices)
-                if bubble_folium_m is not None:
-                    st_folium(
-                        bubble_folium_m,
-                        width            = "100%",
-                        height           = 520,
-                        returned_objects = [],
-                        key              = "bubble_map",
+                st.markdown("**Hub Metrics**")
+                for hm in hub_metrics:
+                    status_icon = "🔴" if hm["hub"] in closed_hubs else "🟢"
+                    st.markdown(
+                        f'<div class="sb-metric">{status_icon} <b>{hm["hub"]}</b><br>'
+                        f'Centrality: {hm.get("centrality", 0):.3f} | '
+                        f'Degree: {hm.get("degree", 0)}</div>',
+                        unsafe_allow_html=True,
                     )
 
-            # ── Tab: Riders & Revenue ─────────────────────────────────────────────
-            with t_rider:
-                rt_rider, rt_revenue = st.tabs(["🏍️ Rider Distribution", "📊 Zone Revenue"])
+            with col_map:
+                route_state = st.session_state.get("last_route")
+                hub_html    = self.maps.render_hub_map(hub_metrics, route_state, closed_hubs)
+                components.html(hub_html, height=560, scrolling=False)
 
-                with rt_rider:
-                    st.markdown("### 🏍️ Rider Distribution Map")
-                    st.caption("Circle size ∝ order count per delivery zone.")
-                    orders = self.db.get_recent_orders(limit=120)
-                    rider_folium_m = self.maps.render_rider_map(orders)
-                    if rider_folium_m is not None:
-                        st_folium(
-                            rider_folium_m,
-                            width            = "100%",
-                            height           = 500,
-                            returned_objects = [],
-                            key              = "rider_map",
+        # ── Tab: Route Planner ────────────────────────────────────────────────
+        with t_route:
+            st.markdown("### 🛣️ Optimal Route Planner")
+            hubs       = list(DHAKA_HUBS.keys())
+            r1, r2, r3 = st.columns(3)
+            with r1: src  = st.selectbox("Origin",      hubs,          key="r_src")
+            with r2: dst  = st.selectbox("Destination", hubs, index=3, key="r_dst")
+            with r3: mode = st.radio(
+                "Optimise for", ["balanced", "distance", "time"],
+                horizontal=True, key="r_mode",
+            )
+
+            if st.button("🔍 Find Route", key="r_btn"):
+                if src == dst:
+                    st.warning("Origin and destination must be different hubs.")
+                else:
+                    result = self.routing.find_optimal_route(src, dst, mode=mode)
+                    if "error" not in result:
+                        st.session_state["last_route"] = result
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Distance",  f'{result["total_km"]} km')
+                        c2.metric("ETA",       f'{result["eta_min"]} min')
+                        c3.metric("Hops",       result["hops"])
+                        c4.metric("CO₂ Saved", f'{result.get("co2_saving_kg", 0):.3f} kg')
+                        st.success(f"Route: **{' → '.join(result['path'])}**")
+                        savings = self.business.calculate_carbon_savings(
+                            result.get("traditional_km", result["total_km"] * 1.3),
+                            result["total_km"],
                         )
-
-                with rt_revenue:
-                    st.markdown("### 📊 Zone Revenue Map")
-                    st.caption("Colour and size ∝ total revenue per zone (brighter = higher).")
-                    zone_stats = self.db.get_zone_stats()
-                    if zone_stats:
-                        rev_folium_m = self.maps.render_zone_revenue(zone_stats)
-                        if rev_folium_m is not None:
-                            st_folium(
-                                rev_folium_m,
-                                width            = "100%",
-                                height           = 500,
-                                returned_objects = [],
-                                key              = "revenue_map",
-                            )
+                        self.db.log_carbon(
+                            f"{src}_{dst}_{int(time.time())}",
+                            result.get("traditional_km", result["total_km"] * 1.3),
+                            result["total_km"],
+                            savings["fuel_saved"],
+                            savings["co2_saved"],
+                            savings["cost_saved"],
+                        )
+                        st.info(
+                            f"💚 Saved: {savings['km_saved']:.2f} km | "
+                            f"৳{savings['cost_saved']:.0f} | "
+                            f"{savings['co2_saved']:.3f} kg CO₂"
+                        )
+                        st.rerun()
                     else:
-                        st.info("No order data yet — place some orders to see the revenue map.")
+                        st.error(result["error"])
+
+            # Route map (always shows last computed route)
+            st.markdown("**Route map** (updates after each 'Find Route' click):")
+            route_html = self.maps.render_hub_map(
+                hub_metrics,
+                st.session_state.get("last_route"),
+                closed_hubs,
+            )
+            components.html(route_html, height=480, scrolling=False)
+
+            st.divider()
+            st.markdown("### 🔄 Multi-Stop Route Planner")
+            mh = st.multiselect(
+                "Select Hubs (min 2)", hubs, default=hubs[:4], key="mh"
+            )
+            if st.button("📍 Plan Multi-Stop", key="ms_btn") and len(mh) >= 2:
+                plan = self.routing.plan_multi_stop(mh, optimize=True)
+                if "error" not in plan:
+                    st.success(f"Route: {' → '.join(plan['route_order'])}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Total km",   f'{plan["total_km"]} km')
+                    c2.metric("Total ETA",  f'{plan["total_eta_min"]} min')
+                    c3.metric("CO₂ Saved",  f'{plan["total_co2_kg"]:.3f} kg')
+                else:
+                    st.error(plan["error"])
+
+        # ── Tab: Demand Bubbles ───────────────────────────────────────────────
+        with t_bubble:
+            st.markdown("### 🫧 Zone Demand Bubble Map")
+            st.caption(
+                "Bubble radius and brightness ∝ weighted demand index "
+                "(avg 7-day forecast × live price × zone variance). "
+                "Click a bubble for the per-SKU breakdown."
+            )
+            fc_map      = fcs if fcs else {
+                i.get("sku_id", ""): {"forecast": [50] * FORECAST_DAYS} for i in inv
+            }
+            bubble_html = self.maps.render_demand_bubbles(inv, fc_map, prices)
+            components.html(bubble_html, height=540, scrolling=False)
+
+        # ── Tab: Riders & Revenue ─────────────────────────────────────────────
+        with t_rider:
+            rt_rider, rt_revenue = st.tabs(["🏍️ Rider Distribution", "📊 Zone Revenue"])
+
+            with rt_rider:
+                st.markdown("### 🏍️ Rider Distribution Map")
+                st.caption("Circle size ∝ order count per delivery zone.")
+                orders     = self.db.get_recent_orders(limit=120)
+                rider_html = self.maps.render_rider_map(orders)
+                components.html(rider_html, height=520, scrolling=False)
+
+            with rt_revenue:
+                st.markdown("### 📊 Zone Revenue Map")
+                st.caption("Colour and size ∝ total revenue per zone (brighter = higher).")
+                zone_stats  = self.db.get_zone_stats()
+                rev_html    = self.maps.render_zone_revenue(zone_stats)
+                components.html(rev_html, height=520, scrolling=False)
     # ═════════════════════════════════════════════════════════════════════════
     # TAB 5 — LOGISTICS
     # ═════════════════════════════════════════════════════════════════════════
