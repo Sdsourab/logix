@@ -3252,1005 +3252,844 @@ class NexusUI:
 
         # ── Inventory Health Intelligence Dashboard ───────────────────────────
         st.markdown("### 📊 Inventory Health Intelligence")
+        import json as _json, datetime as _dt
 
-        # ── Compute rich metrics per SKU ─────────────────────────────────────
-        health_rows = []
-        cat_counts  = {"🟢 Healthy": 0, "🟡 Watch": 0, "🔴 Critical": 0, "🟣 Overstock": 0}
-        for item in inv:
-            sid   = item.get("sku_id", "")
-            name  = item.get("name", sid)
-            cat   = item.get("category", "")
-            stk   = item.get("current_stock", 0)
-            rop   = item.get("reorder_point", 20)
-            eoq   = max(item.get("eoq", 50), 1)
-            exp   = item.get("expiry_days", 999)
-            cost  = item.get("unit_cost", 0)
-            sell  = prices.get(sid, {}).get("price") or item.get("selling_price") or cost * 1.15
-            sell  = sell or cost * 1.15
+        _now_ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # ── Health score (0–100) ──────────────────────────────────────────
-            stock_ratio = stk / eoq                               # 0=empty, 1=EOQ, >2=overstock
-            stock_score = (
-                0   if stk == 0 else
-                15  if stk < rop * 0.5 else
-                35  if stk < rop else
-                85  if stock_ratio <= 1.0 else
-                100 if stock_ratio <= 2.0 else
-                60                                                # overstock penalty
-            )
-            expiry_score = (
-                0   if exp <= 1 else
-                20  if exp <= 3 else
-                50  if exp <= 7 else
-                80  if exp <= 30 else
-                100
-            )
-            margin_score = 0.0
-            if sell > 0 and cost > 0:
-                m = (sell - cost) / sell
-                margin_score = min(max(m * 200, 0), 100)          # 50% margin → 100 pts
-            else:
-                margin_score = 50.0
+        # ── Per-SKU rich metrics ──────────────────────────────────────────────
+        _rows = []
+        _cat_counts = {"Healthy": 0, "Watch": 0, "Critical": 0, "Overstock": 0}
+        for _item in inv:
+            _sid  = _item.get("sku_id", "")
+            _name = _item.get("name", _sid)
+            _cat  = _item.get("category", "")
+            _stk  = _item.get("current_stock", 0)
+            _rop  = _item.get("reorder_point", 20)
+            _eoq  = max(_item.get("eoq", 50), 1)
+            _exp  = _item.get("expiry_days", 999)
+            _cost = _item.get("unit_cost", 0) or 0
+            _sell = (prices.get(_sid, {}).get("price") or
+                     _item.get("selling_price") or
+                     _cost * 1.15 or 1)
+            _sell = float(_sell) if _sell else _cost * 1.15 or 1
 
-            health_score = round(stock_score * 0.50 + expiry_score * 0.30 + margin_score * 0.20)
+            _ratio      = _stk / _eoq
+            _ss = (0   if _stk == 0 else
+                   15  if _stk < _rop * 0.5 else
+                   35  if _stk < _rop else
+                   85  if _ratio <= 1.0 else
+                   100 if _ratio <= 2.0 else 60)
+            _es = (0   if _exp <= 1 else
+                   20  if _exp <= 3 else
+                   50  if _exp <= 7 else
+                   80  if _exp <= 30 else 100)
+            _ms = min(max((_sell - _cost) / _sell * 200, 0), 100) if _sell > 0 else 50
+            _hs = round(_ss * 0.50 + _es * 0.30 + _ms * 0.20)
+            _mg = round((_sell - _cost) / max(_sell, 1) * 100, 1)
 
-            if stk > eoq * 2.0:
-                label = "🟣 Overstock"; cat_counts["🟣 Overstock"] += 1
-            elif health_score >= 70:
-                label = "🟢 Healthy";   cat_counts["🟢 Healthy"] += 1
-            elif health_score >= 40:
-                label = "🟡 Watch";     cat_counts["🟡 Watch"] += 1
-            else:
-                label = "🔴 Critical";  cat_counts["🔴 Critical"] += 1
+            if   _stk > _eoq * 2.0: _lbl = "Overstock"; _cat_counts["Overstock"]  += 1
+            elif _hs >= 70:          _lbl = "Healthy";   _cat_counts["Healthy"]    += 1
+            elif _hs >= 40:          _lbl = "Watch";     _cat_counts["Watch"]      += 1
+            else:                    _lbl = "Critical";  _cat_counts["Critical"]   += 1
 
-            cover_days = round(stk / max(sum(
-                prices.get(sid, {}).get("price", cost) or cost for _ in [1]
-            ) / max(cost, 1), 0.1), 1) if cost else stk         # simplified
-            margin_pct = round((sell - cost) / max(sell, 1) * 100, 1) if sell else 0
-
-            # Reorder urgency 0-100
-            urgency = 0 if stk > rop else round(min((rop - stk) / max(rop, 1) * 100, 100))
-
-            health_rows.append({
-                "sid": sid, "name": name, "category": cat,
-                "stk": stk, "rop": rop, "eoq": eoq, "exp": exp,
-                "cost": cost, "sell": round(sell, 1), "margin": margin_pct,
-                "health": health_score, "label": label,
-                "urgency": urgency,
-                "stock_score": stock_score, "expiry_score": expiry_score,
-                "margin_score": round(margin_score, 1),
-                "stock_ratio": round(stock_ratio, 2),
+            _rows.append({
+                "name": _name, "cat": _cat, "stk": _stk, "rop": _rop,
+                "eoq": _eoq, "exp": min(_exp, 90), "cost": _cost,
+                "sell": round(_sell, 1), "margin": _mg, "health": _hs,
+                "label": _lbl, "urgency": 0 if _stk >= _rop else round(min((_rop - _stk) / max(_rop, 1) * 100, 100)),
+                "ss": _ss, "es": _es, "ms": round(_ms, 1),
+                "ratio": round(_ratio, 2),
+                "half_rop": round(_rop * 0.5),
+                "ov_thresh": _eoq * 2,
+                "fill_pct": round(_ratio * 100, 1),
+                "gap": _rop - _stk,
+                "order_qty": max(0, _eoq - _stk),
+                "days_cover": round(_stk / max(_rop / 7.0, 0.5), 1),
             })
 
-        # ── KPI summary strip ─────────────────────────────────────────────────
-        avg_health  = round(sum(r["health"] for r in health_rows) / max(len(health_rows), 1))
-        critical_ct = cat_counts["🔴 Critical"]
-        watch_ct    = cat_counts["🟡 Watch"]
-        healthy_ct  = cat_counts["🟢 Healthy"]
-        overstock_ct= cat_counts["🟣 Overstock"]
-        exp_urgent  = sum(1 for r in health_rows if r["exp"] <= 3)
-        needs_order = sum(1 for r in health_rows if r["stk"] < r["rop"])
+        # ── Aggregate KPIs ────────────────────────────────────────────────────
+        _avg_h      = round(sum(r["health"] for r in _rows) / max(len(_rows), 1))
+        _need_order = sum(1 for r in _rows if r["stk"] < r["rop"])
+        _exp_urgent = sum(1 for r in _rows if r["exp"] <= 3)
 
-        kc = st.columns(6)
-        kc[0].metric("🏥 Portfolio Health", f"{avg_health}/100",
-                     delta="Good" if avg_health >= 70 else ("Watch" if avg_health >= 40 else "Critical"))
-        kc[1].metric("🔴 Critical",  critical_ct,  delta_color="inverse")
-        kc[2].metric("🟡 Watch",     watch_ct,     delta_color="inverse")
-        kc[3].metric("🟢 Healthy",   healthy_ct)
-        kc[4].metric("⏰ Expiry ≤3d", exp_urgent,   delta_color="inverse")
-        kc[5].metric("📦 Need Order", needs_order,  delta_color="inverse")
+        _kc = st.columns(6)
+        _kc[0].metric("🏥 Portfolio Health",  f"{_avg_h}/100")
+        _kc[1].metric("🔴 Critical",  _cat_counts["Critical"],  delta_color="inverse")
+        _kc[2].metric("🟡 Watch",     _cat_counts["Watch"],     delta_color="inverse")
+        _kc[3].metric("🟢 Healthy",   _cat_counts["Healthy"])
+        _kc[4].metric("⏰ Expire ≤3d", _exp_urgent,             delta_color="inverse")
+        _kc[5].metric("📦 Need Order", _need_order,             delta_color="inverse")
 
-        st.markdown("<br>", unsafe_allow_html=True)
+        # ── Color helpers (Python-side, safe strings) ─────────────────────────
+        def _hcol(r):
+            return ("#ff3366" if r["label"] == "Critical"  else
+                    "#ffbb00" if r["label"] == "Watch"     else
+                    "#a855f7" if r["label"] == "Overstock" else "#00ff88")
 
-        # ── Build JS data payloads ─────────────────────────────────────────────
-        names_js      = str([r["name"] for r in health_rows])
-        stk_js        = str([r["stk"]  for r in health_rows])
-        rop_js        = str([r["rop"]  for r in health_rows])
-        eoq_js        = str([r["eoq"]  for r in health_rows])
-        health_js     = str([r["health"] for r in health_rows])
-        margin_js     = str([r["margin"] for r in health_rows])
-        urgency_js    = str([r["urgency"] for r in health_rows])
-        exp_js        = str([min(r["exp"], 90) for r in health_rows])
-        cat_labels_js = str(list(cat_counts.keys()))
-        cat_vals_js   = str(list(cat_counts.values()))
+        # ══════════════════════════════════════════════════════════════════════
+        # IFRAME 1 — Stock Level Intelligence (line chart dashboard)
+        # ══════════════════════════════════════════════════════════════════════
+        _names   = [r["name"]      for r in _rows]
+        _stks    = [r["stk"]       for r in _rows]
+        _rops    = [r["rop"]       for r in _rows]
+        _eoqs    = [r["eoq"]       for r in _rows]
+        _hrops   = [r["half_rop"]  for r in _rows]
+        _ovts    = [r["ov_thresh"] for r in _rows]
+        _fills   = [r["fill_pct"]  for r in _rows]
+        _gaps    = [r["gap"]       for r in _rows]
+        _ordqs   = [r["order_qty"] for r in _rows]
+        _dcovs   = [r["days_cover"]for r in _rows]
+        _zones   = [r["label"]     for r in _rows]
+        _ptcols  = [_hcol(r)       for r in _rows]
+        _catsh   = [r["cat"][:8]   for r in _rows]
+        _healths = [r["health"]    for r in _rows]
+        _margins = [r["margin"]    for r in _rows]
+        _urgents = [r["urgency"]   for r in _rows]
 
-        # ── Color per SKU by health label ─────────────────────────────────────
-        bar_colors_js = str([
-            "#00ff88" if r["label"] == "🟢 Healthy" else
-            "#ffbb00" if r["label"] == "🟡 Watch" else
-            "#ff3366" if r["label"] == "🔴 Critical" else
-            "#a855f7"
-            for r in health_rows
-        ])
+        _avg_fill = round(sum(_fills) / max(len(_fills), 1), 1)
+        _total_ord = sum(_ordqs)
 
-        # ── Radar axes per SKU (first 4 for readability) ──────────────────────
-        radar_data = health_rows[:4]
-        radar_datasets_js = "[" + ",".join([
-            f"""{{
-                label: '{r["name"][:10]}',
-                data: [{r["stock_score"]},{r["expiry_score"]},{r["margin_score"]},
-                       {100 - r["urgency"]},{min(int(r["stock_ratio"]*50),100)}],
-                borderColor: '{
-                    "#00ff88" if r["label"]=="🟢 Healthy" else
-                    "#ffbb00" if r["label"]=="🟡 Watch" else
-                    "#ff3366" if r["label"]=="🔴 Critical" else "#a855f7"
-                }',
-                backgroundColor: '{
-                    "rgba(0,255,136,0.07)" if r["label"]=="🟢 Healthy" else
-                    "rgba(255,187,0,0.07)" if r["label"]=="🟡 Watch" else
-                    "rgba(255,51,102,0.07)" if r["label"]=="🔴 Critical" else "rgba(168,85,247,0.07)"
-                }',
-                borderWidth:2, pointRadius:4, pointHoverRadius:6
-            }}"""
-            for r in radar_data
-        ]) + "]"
+        # Tile counts
+        _crit_n  = _cat_counts["Critical"]
+        _low_n   = sum(1 for r in _rows if r["stk"] < r["rop"] and r["label"] != "Critical")
+        _hlth_n  = _cat_counts["Healthy"]
+        _ov_n    = _cat_counts["Overstock"]
 
-        # ── Scatter: Health Score vs Margin ───────────────────────────────────
-        scatter_js = "[" + ",".join([
-            f"{{x:{r['margin']},y:{r['health']},label:'{r['name'][:8]}',r:{max(r['stk']//8,6)}}}"
-            for r in health_rows
-        ]) + "]"
+        _i1_data = {
+            "ts": _now_ts,
+            "names": _names, "stks": _stks, "rops": _rops, "eoqs": _eoqs,
+            "hrops": _hrops, "ovts": _ovts, "fills": _fills, "gaps": _gaps,
+            "ordqs": _ordqs, "dcovs": _dcovs, "zones": _zones,
+            "ptcols": _ptcols, "catsh": _catsh, "healths": _healths,
+            "critN": _crit_n, "lowN": _low_n, "hlthN": _hlth_n, "ovN": _ov_n,
+            "avgFill": _avg_fill, "totalOrd": _total_ord,
+        }
+        _i1_json = _json.dumps(_i1_data)
 
-        # ── Enhanced Stock Line Chart data payloads ────────────────────────────
-        import datetime as _dt
-        _ts_now     = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        gap_js      = str([r["rop"] - r["stk"] for r in health_rows])          # + = below ROP
-        ratio_pct_js= str([round(r["stock_ratio"] * 100, 1) for r in health_rows])
-        half_rop_js = str([round(r["rop"] * 0.5) for r in health_rows])
-        ov_thresh_js= str([r["eoq"] * 2 for r in health_rows])
-        order_qty_js= str([max(0, r["eoq"] - r["stk"]) for r in health_rows])
-
-        # days_cover = stock ÷ (ROP / 7)  — proxy for weekly reorder cycle
-        days_cover_js = str([
-            round(r["stk"] / max(r["rop"] / 7.0, 0.5), 1)
-            for r in health_rows
-        ])
-
-        zone_js = str([
-            "CRITICAL"  if r["stk"] == 0 else
-            "CRITICAL"  if r["stk"] < r["rop"] * 0.5 else
-            "LOW"       if r["stk"] < r["rop"] else
-            "OVERSTOCK" if r["stk"] > r["eoq"] * 2 else
-            "HEALTHY"
-            for r in health_rows
-        ])
-
-        # Per-point colors for the stock line
-        pt_colors_js = str([
-            "#ff3366" if r["stk"] < r["rop"] * 0.5 else
-            "#ffbb00" if r["stk"] < r["rop"] else
-            "#a855f7" if r["stk"] > r["eoq"] * 2 else
-            "#00ff88"
-            for r in health_rows
-        ])
-
-        # Short category labels for badge row
-        cat_short_js = str([r["category"][:8] for r in health_rows])
-
-        inv_dashboard_html = f"""<!DOCTYPE html>
-<html><head>
+        _iframe1 = """<!DOCTYPE html><html><head>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
-  * {{ box-sizing:border-box; margin:0; padding:0; }}
-  body {{ background:#0a0e1a; color:#e0e8ff; font-family:'Segoe UI',monospace,sans-serif; padding:16px; }}
-  .grid {{ display:grid; gap:16px; }}
-  .row2 {{ grid-template-columns:1fr 1fr; }}
-  .row3 {{ grid-template-columns:2fr 1.2fr 1fr; }}
-  .panel {{
-    background:linear-gradient(135deg,#0d1224,#111827);
-    border:1px solid #1e3a5f; border-radius:12px; padding:16px;
-    position:relative; overflow:hidden;
-  }}
-  .panel::before {{
-    content:''; position:absolute; top:0; left:0; right:0; height:2px;
-    background:linear-gradient(90deg,#00ff88,#00cfff,#a855f7);
-  }}
-  .panel-title {{
-    font-size:.78rem; font-weight:700; color:#7dd3fc;
-    letter-spacing:.8px; text-transform:uppercase; margin-bottom:12px;
-  }}
-  canvas {{ max-width:100%; }}
-
-  /* Zone legend pills */
-  .zone-pill {{
-    display:inline-flex; align-items:center; gap:4px;
-    font-size:.62rem; font-weight:700; letter-spacing:.3px;
-    padding:2px 8px; border-radius:20px; border:1px solid;
-  }}
-
-  /* Stat tiles */
-  .stat-tile {{
-    background:#0a0e1a; border:1px solid #1e3a5f; border-radius:8px;
-    padding:8px 10px; text-align:center;
-  }}
-  .stat-tile-val {{ font-size:1.3rem; font-weight:800; line-height:1; }}
-  .stat-tile-lbl {{ font-size:.60rem; color:#94a3b8; margin-top:3px; }}
-
-  /* SKU badge strip */
-  .sku-badge {{
-    background:#0a0e1a; border-radius:8px; padding:9px;
-    position:relative; overflow:hidden;
-    border-left:3px solid transparent;
-  }}
-  .sku-badge-name  {{ font-size:.65rem; color:#7dd3fc; font-weight:700; margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-  .sku-badge-zone  {{ font-size:.60rem; font-weight:800; letter-spacing:.4px; margin-bottom:4px; }}
-  .sku-badge-row   {{ display:flex; justify-content:space-between; font-size:.58rem; color:#94a3b8; margin-top:2px; }}
-  .sku-badge-val   {{ color:#cbd5e1; font-weight:600; }}
-
-  /* SKU Health Cards grid */
-  .cards {{ display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-top:4px; }}
-  .card {{
-    background:#0a0e1a; border:1px solid #1e3a5f; border-radius:8px;
-    padding:8px; text-align:center; position:relative; overflow:hidden;
-  }}
-  .card-bar {{
-    position:absolute; bottom:0; left:0; right:0; height:3px;
-    border-radius:0 0 8px 8px;
-  }}
-  .card-name {{ font-size:.65rem; color:#7dd3fc; margin-bottom:3px; font-weight:600; }}
-  .card-score {{ font-size:1.4rem; font-weight:800; line-height:1; }}
-  .card-label {{ font-size:.58rem; margin-top:2px; }}
-  .card-stats {{ font-size:.58rem; color:#94a3b8; margin-top:4px; line-height:1.5; }}
-
-  /* Expiry timeline */
-  .expiry-row {{ display:flex; align-items:center; gap:8px; margin:4px 0; }}
-  .expiry-name {{ width:110px; font-size:.68rem; color:#cbd5e1; flex-shrink:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-  .expiry-track {{ flex:1; height:14px; background:#1e2a3a; border-radius:7px; overflow:hidden; position:relative; }}
-  .expiry-fill {{ height:100%; border-radius:7px; display:flex; align-items:center; padding-left:6px; }}
-  .expiry-val {{ font-size:.58rem; font-weight:700; color:#0a0e1a; white-space:nowrap; }}
-  .expiry-days {{ font-size:.62rem; color:#94a3b8; width:42px; text-align:right; flex-shrink:0; }}
-
-  /* Urgency meter */
-  .urg-row {{ display:flex; align-items:center; gap:6px; margin:5px 0; }}
-  .urg-name {{ width:100px; font-size:.66rem; color:#cbd5e1; flex-shrink:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-  .urg-track {{ flex:1; height:12px; background:#1e2a3a; border-radius:6px; overflow:hidden; }}
-  .urg-fill {{ height:100%; border-radius:6px; }}
-  .urg-pct {{ font-size:.60rem; color:#94a3b8; width:30px; text-align:right; flex-shrink:0; }}
-
-  /* ABC badges */
-  .abc-grid {{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-top:8px; }}
-  .abc-cell {{ background:#111827; border-radius:8px; padding:8px; text-align:center; }}
-  .abc-letter {{ font-size:1.6rem; font-weight:900; }}
-  .abc-label {{ font-size:.6rem; color:#94a3b8; margin-top:2px; }}
-  .abc-items {{ font-size:.62rem; color:#cbd5e1; margin-top:3px; }}
-</style>
-</head>
-<body>
-
-<!-- ── Row 1: SKU Health Cards ─────────────────────────────────────────── -->
-<div class="panel" style="margin-bottom:16px;">
-  <div class="panel-title">🏥 Per-SKU Health Score  ·  Composite (Stock 50% · Expiry 30% · Margin 20%)</div>
-  <div class="cards" id="skuCards"></div>
-</div>
-
-<!-- ── Row 2: Stock Line Chart (FULL WIDTH) ───────────────────────────── -->
-<div class="panel" style="margin-bottom:16px;">
-
-  <!-- Header row -->
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
-    <div>
-      <div class="panel-title" style="margin-bottom:2px;">
-        📦 STOCK LEVEL INTELLIGENCE  ·  Current vs Reorder Point vs EOQ vs Thresholds
-      </div>
-      <div style="font-size:.68rem;color:#94a3b8;">
-        Line chart — 5 reference layers  ·  Per-SKU zone colouring  ·  Real-time data
-      </div>
-    </div>
-    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
-      <!-- Zone legend pills -->
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <span class="zone-pill" style="background:rgba(255,51,102,.18);border-color:#ff3366;color:#ff3366;">🔴 Critical  &lt; ½ ROP</span>
-        <span class="zone-pill" style="background:rgba(255,187,0,.15);border-color:#ffbb00;color:#ffbb00;">🟡 Low  &lt; ROP</span>
-        <span class="zone-pill" style="background:rgba(0,255,136,.13);border-color:#00ff88;color:#00ff88;">🟢 Healthy  ROP → 2×EOQ</span>
-        <span class="zone-pill" style="background:rgba(168,85,247,.15);border-color:#a855f7;color:#a855f7;">🟣 Overstock  &gt; 2×EOQ</span>
-      </div>
-      <div id="liveStamp" style="font-size:.65rem;color:#475569;white-space:nowrap;"></div>
-    </div>
-  </div>
-
-  <!-- Summary stat tiles -->
-  <div id="statTiles" style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:14px;"></div>
-
-  <!-- Main chart -->
-  <div style="position:relative;height:340px;">
-    <canvas id="stockLineChart"></canvas>
-  </div>
-
-  <!-- Per-SKU detail badge strip -->
-  <div id="skuBadgeStrip" style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:14px;"></div>
-
-  <!-- Secondary: Stock Fill-Rate bar -->
-  <div style="margin-top:16px;border-top:1px solid #1e3a5f;padding-top:14px;">
-    <div class="panel-title" style="margin-bottom:8px;">📊 Stock Fill Rate (% of EOQ)  ·  Target Zone: 50% – 150%</div>
-    <div style="position:relative;height:110px;">
-      <canvas id="fillRateChart"></canvas>
-    </div>
-  </div>
-
-  <!-- Gap-to-ROP analysis -->
-  <div style="margin-top:16px;border-top:1px solid #1e3a5f;padding-top:14px;">
-    <div class="panel-title" style="margin-bottom:8px;">⚡ Gap to Reorder Point  ·  Positive = Units Needed  ·  Negative = Buffer Above ROP</div>
-    <div style="position:relative;height:110px;">
-      <canvas id="gapChart"></canvas>
-    </div>
-  </div>
-</div>
-
-<!-- ── Row 2b: Radar (now standalone half+half) ───────────────────────── -->
-<div class="grid row2" style="margin-bottom:16px;">
-  <div class="panel">
-    <div class="panel-title">🕸️ Multi-Dimension Radar  ·  Top 4 SKUs</div>
-    <canvas id="radarChart" height="220"></canvas>
-  </div>
-  <!-- second half: reuse donut here so row is balanced -->
-  <div class="panel">
-    <div class="panel-title">🍩 Portfolio Status Distribution</div>
-    <canvas id="donutChart" height="170"></canvas>
-    <div id="donutLegend" style="margin-top:8px;"></div>
-  </div>
-</div>
-
-<!-- ── Row 3: Portfolio Bubble + Urgency ──────────────────────────────── -->
-<div class="grid row2" style="margin-bottom:16px;">
-  <div class="panel">
-    <div class="panel-title">💹 Health Score vs Gross Margin  ·  Bubble = Stock Qty</div>
-    <canvas id="bubbleChart" height="210"></canvas>
-  </div>
-  <div class="panel">
-    <div class="panel-title">⚡ Reorder Urgency</div>
-    <div id="urgencyList"></div>
-  </div>
-</div>
-
-<!-- ── Row 4: Expiry Timeline  +  Margin Bars ──────────────────────────── -->
-<div class="grid row2">
-  <div class="panel">
-    <div class="panel-title">⏰ Expiry Countdown Timeline  ·  Days Remaining (capped 90d)</div>
-    <div id="expiryList"></div>
-  </div>
-  <div class="panel">
-    <div class="panel-title">💰 Gross Margin % per SKU  ·  with ABC Classification</div>
-    <canvas id="marginChart" height="160"></canvas>
-    <div class="abc-grid" id="abcGrid"></div>
-  </div>
-</div>
-
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0e1a;color:#e0e8ff;font-family:'Segoe UI',monospace,sans-serif;padding:14px}
+.panel{background:linear-gradient(135deg,#0d1224,#111827);border:1px solid #1e3a5f;
+  border-radius:12px;padding:14px;position:relative;overflow:hidden;margin-bottom:14px}
+.panel::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,#00ff88,#00cfff,#a855f7)}
+.pt{font-size:.72rem;font-weight:700;color:#7dd3fc;letter-spacing:.7px;
+    text-transform:uppercase;margin-bottom:8px}
+.sub{font-size:.60rem;color:#94a3b8;margin-bottom:10px}
+.tiles{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:12px}
+.tile{background:#0a0e1a;border:1px solid #1e3a5f;border-radius:8px;
+      padding:8px;text-align:center}
+.tv{font-size:1.3rem;font-weight:800;line-height:1}
+.tl{font-size:.58rem;color:#94a3b8;margin-top:3px}
+.badges{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px}
+.badge{background:#0a0e1a;border-left:3px solid #1e3a5f;border-radius:8px;
+       padding:8px;font-size:.60rem}
+.bn{font-size:.64rem;color:#7dd3fc;font-weight:700;margin-bottom:3px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bz{font-size:.60rem;font-weight:800;margin-bottom:4px}
+.br{display:flex;justify-content:space-between;color:#94a3b8;margin-top:1px}
+.bv{color:#cbd5e1;font-weight:600}
+.legend{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:8px}
+.lp{display:inline-flex;align-items:center;gap:5px;font-size:.62rem;font-weight:700;
+    padding:2px 8px;border-radius:20px;border:1px solid}
+</style></head><body>
+<div id="root"></div>
 <script>
-// ── Data ───────────────────────────────────────────────────────────────────
-const names      = {names_js};
-const stocks     = {stk_js};
-const rops       = {rop_js};
-const eoqs       = {eoq_js};
-const healths    = {health_js};
-const margins    = {margin_js};
-const urgencies  = {urgency_js};
-const expiryDays = {exp_js};
-const catLabels  = {cat_labels_js};
-const catVals    = {cat_vals_js};
-const barColors  = {bar_colors_js};
-const scatterRaw = {scatter_js};
+const D = """ + _i1_json + """;
+const GC='rgba(30,58,95,0.6)',LC='#7dd3fc',TC='#94a3b8';
+Chart.defaults.color=TC;
+Chart.defaults.font.family="'Segoe UI',monospace";
+Chart.defaults.font.size=11;
 
-// ── Enhanced stock chart data ───────────────────────────────────────────────
-const ptColors    = {pt_colors_js};
-const halfRops    = {half_rop_js};
-const ovThresh    = {ov_thresh_js};
-const gapToRop    = {gap_js};
-const ratiosPct   = {ratio_pct_js};
-const daysCover   = {days_cover_js};
-const orderQtys   = {order_qty_js};
-const zones       = {zone_js};
-const catShort    = {cat_short_js};
-const LIVE_TS     = "{_ts_now}";
+function zCol(z){
+  return z==='Critical'?'#ff3366':z==='Watch'?'#ffbb00':z==='Overstock'?'#a855f7':'#00ff88';
+}
+function zBg(z){
+  return z==='Critical'?'rgba(255,51,102,.10)':z==='Watch'?'rgba(255,187,0,.07)':
+         z==='Overstock'?'rgba(168,85,247,.08)':'rgba(0,255,136,.05)';
+}
 
-const PANEL_BG = '#0d1224';
-const GRID_CLR = 'rgba(30,58,95,0.6)';
-const LABEL_CLR= '#7dd3fc';
-const TEXT_CLR = '#94a3b8';
+const root = document.getElementById('root');
 
-Chart.defaults.color = TEXT_CLR;
-Chart.defaults.font.family = "'Segoe UI', monospace";
-Chart.defaults.font.size   = 11;
-
-// ── 1. SKU Health Cards ───────────────────────────────────────────────────
-const cardsEl = document.getElementById('skuCards');
-names.forEach((n,i) => {{
-  const h   = healths[i];
-  const col = h>=70 ? '#00ff88' : h>=40 ? '#ffbb00' : '#ff3366';
-  const lbl = h>=70 ? '🟢 Healthy' : h>=40 ? '🟡 Watch' : '🔴 Critical';
-  const sr  = (stocks[i]/eoqs[i]).toFixed(2);
-  cardsEl.innerHTML += `
-    <div class="card">
-      <div class="card-name">${{n.substring(0,13)}}</div>
-      <div class="card-score" style="color:${{col}}">${{h}}</div>
-      <div class="card-label" style="color:${{col}}">${{lbl}}</div>
-      <div class="card-stats">
-        📦 ${{stocks[i]}} / ${{eoqs[i]}}<br>
-        🔁 ROP: ${{rops[i]}}<br>
-        💹 ${{margins[i]}}%<br>
-        ⏰ ${{expiryDays[i]}}d
-      </div>
-      <div class="card-bar" style="background:${{col}};opacity:0.7;width:${{h}}%"></div>
-    </div>`;
-}});
-
-// ── 2. LIVE TIMESTAMP ──────────────────────────────────────────────────────
-document.getElementById('liveStamp').textContent = '🕐 Last updated: ' + LIVE_TS;
-
-// ── ZONE COLOUR HELPER ─────────────────────────────────────────────────────
-function zoneColor(z) {{
-  if (z==='CRITICAL')  return '#ff3366';
-  if (z==='LOW')       return '#ffbb00';
-  if (z==='OVERSTOCK') return '#a855f7';
-  return '#00ff88';
-}}
-function zoneBg(z) {{
-  if (z==='CRITICAL')  return 'rgba(255,51,102,.12)';
-  if (z==='LOW')       return 'rgba(255,187,0,.09)';
-  if (z==='OVERSTOCK') return 'rgba(168,85,247,.10)';
-  return 'rgba(0,255,136,.07)';
-}}
-
-// ── STAT TILES ─────────────────────────────────────────────────────────────
-const critCount  = zones.filter(z=>z==='CRITICAL').length;
-const lowCount   = zones.filter(z=>z==='LOW').length;
-const healthyCount=zones.filter(z=>z==='HEALTHY').length;
-const ovCount    = zones.filter(z=>z==='OVERSTOCK').length;
-const avgRatio   = (ratiosPct.reduce((a,b)=>a+b,0)/ratiosPct.length).toFixed(1);
-const totalOrder = orderQtys.reduce((a,b)=>a+b,0);
-
+// ── Tiles ─────────────────────────────────────────────────────────────
 const tileData = [
-  {{ val: critCount,     lbl: '🔴 Critical SKUs',    col: '#ff3366' }},
-  {{ val: lowCount,      lbl: '🟡 Below ROP',         col: '#ffbb00' }},
-  {{ val: healthyCount,  lbl: '🟢 Healthy',           col: '#00ff88' }},
-  {{ val: ovCount,       lbl: '🟣 Overstock',         col: '#a855f7' }},
-  {{ val: avgRatio+'%',  lbl: '📊 Avg Fill Rate',     col: '#00cfff' }},
-  {{ val: totalOrder,    lbl: '📦 Total Units Needed', col: '#f97316' }},
+  {v:D.critN,  l:'🔴 Critical',      c:'#ff3366'},
+  {v:D.lowN,   l:'🟡 Below ROP',     c:'#ffbb00'},
+  {v:D.hlthN,  l:'🟢 Healthy',       c:'#00ff88'},
+  {v:D.ovN,    l:'🟣 Overstock',     c:'#a855f7'},
+  {v:D.avgFill+'%',l:'📊 Avg Fill',  c:'#00cfff'},
+  {v:D.totalOrd,   l:'📦 Units Needed',c:'#f97316'},
 ];
-const tilesEl = document.getElementById('statTiles');
-tileData.forEach(t => {{
-  tilesEl.innerHTML += `<div class="stat-tile">
-    <div class="stat-tile-val" style="color:${{t.col}}">${{t.val}}</div>
-    <div class="stat-tile-lbl">${{t.lbl}}</div>
-  </div>`;
-}});
+let tilesHTML = '<div class="tiles">';
+tileData.forEach(t=>{
+  tilesHTML += '<div class="tile"><div class="tv" style="color:'+t.c+'">'+t.v+'</div>'
+             + '<div class="tl">'+t.l+'</div></div>';
+});
+tilesHTML += '</div>';
 
-// ── ZONE BAND PLUGIN (draws colored background per SKU column) ─────────────
-const zoneBandPlugin = {{
-  id: 'zoneBands',
-  beforeDraw(chart) {{
-    const {{ctx, chartArea:{{left,right,top,bottom}}, scales:{{x,y}}}} = chart;
-    if (!x || !y) return;
-    const n = names.length;
-    const colW = (right - left) / n;
+// ── Legend ─────────────────────────────────────────────────────────────
+const legHTML = '<div class="legend">'
+  +'<span class="lp" style="background:rgba(255,51,102,.18);border-color:#ff3366;color:#ff3366;">🔴 Critical &lt;½ROP</span>'
+  +'<span class="lp" style="background:rgba(255,187,0,.14);border-color:#ffbb00;color:#ffbb00;">🟡 Low &lt;ROP</span>'
+  +'<span class="lp" style="background:rgba(0,255,136,.12);border-color:#00ff88;color:#00ff88;">🟢 Healthy</span>'
+  +'<span class="lp" style="background:rgba(168,85,247,.14);border-color:#a855f7;color:#a855f7;">🟣 Overstock &gt;2×EOQ</span>'
+  +'<span style="font-size:.62rem;color:#475569;margin-left:auto">🕐 '+D.ts+'</span>'
+  +'</div>';
+
+// ── Zone band plugin ───────────────────────────────────────────────────
+const zoneBands = {
+  id:'zb',
+  beforeDraw(chart){
+    const {ctx,chartArea:{left,right,top,bottom},scales:{x,y}} = chart;
+    if(!x||!y) return;
+    const w=(right-left)/D.names.length;
     ctx.save();
-    zones.forEach((z, i) => {{
-      const cx = x.getPixelForValue(i);
-      ctx.fillStyle = zoneBg(z);
-      ctx.fillRect(cx - colW/2, top, colW, bottom - top);
-    }});
+    D.zones.forEach((z,i)=>{
+      const cx=x.getPixelForValue(i);
+      ctx.fillStyle=zBg(z);
+      ctx.fillRect(cx-w/2,top,w,bottom-top);
+    });
     ctx.restore();
-  }}
-}};
+  }
+};
 
-// ── 2. MAIN STOCK LINE CHART ───────────────────────────────────────────────
-new Chart(document.getElementById('stockLineChart'), {{
-  type: 'line',
-  plugins: [zoneBandPlugin],
-  data: {{
-    labels: names,
-    datasets: [
-      // ── Dataset 1: Current Stock (main line, per-point colored) ──────────
-      {{
-        label: 'Current Stock',
-        data: stocks,
-        borderColor: '#00cfff',
-        borderWidth: 2.5,
-        tension: 0.38,
-        fill: false,
-        pointBackgroundColor: ptColors,
-        pointBorderColor: ptColors,
-        pointRadius: 7,
-        pointHoverRadius: 10,
-        pointBorderWidth: 2,
-        order: 1,
-        z: 10,
-      }},
-      // ── Dataset 2: Reorder Point (dashed amber) ──────────────────────────
-      {{
-        label: 'Reorder Point (ROP)',
-        data: rops,
-        borderColor: '#ffbb00',
-        borderWidth: 1.8,
-        borderDash: [6, 4],
-        tension: 0.25,
-        fill: false,
-        pointRadius: 4,
-        pointHoverRadius: 7,
-        pointBackgroundColor: '#ffbb00',
-        pointBorderColor: '#ffbb00',
-        order: 2,
-      }},
-      // ── Dataset 3: EOQ Target (dashed cyan) ─────────────────────────────
-      {{
-        label: 'EOQ Target',
-        data: eoqs,
-        borderColor: '#00ff88',
-        borderWidth: 1.8,
-        borderDash: [8, 5],
-        tension: 0.25,
-        fill: false,
-        pointRadius: 4,
-        pointHoverRadius: 7,
-        pointBackgroundColor: '#00ff88',
-        pointBorderColor: '#00ff88',
-        order: 3,
-      }},
-      // ── Dataset 4: Overstock Threshold 2×EOQ (dotted purple) ─────────────
-      {{
-        label: 'Overstock Threshold (2×EOQ)',
-        data: ovThresh,
-        borderColor: '#a855f7',
-        borderWidth: 1.4,
-        borderDash: [3, 6],
-        tension: 0.25,
-        fill: false,
-        pointRadius: 3,
-        pointHoverRadius: 6,
-        pointBackgroundColor: '#a855f7',
-        pointBorderColor: '#a855f7',
-        order: 4,
-      }},
-      // ── Dataset 5: Critical boundary ½×ROP (faint red dotted) ────────────
-      {{
-        label: 'Critical Boundary (½ ROP)',
-        data: halfRops,
-        borderColor: 'rgba(255,51,102,0.55)',
-        borderWidth: 1.2,
-        borderDash: [2, 8],
-        tension: 0.25,
-        fill: false,
-        pointRadius: 2,
-        pointHoverRadius: 5,
-        pointBackgroundColor: 'rgba(255,51,102,0.55)',
-        order: 5,
-      }},
+// ── Main stock line chart ──────────────────────────────────────────────
+const c1 = document.createElement('div');
+c1.className='panel';
+c1.innerHTML='<div class="pt">📦 STOCK LEVEL INTELLIGENCE · Current vs ROP vs EOQ vs Thresholds</div>'
+ +'<div class="sub">5 reference lines · Zone background per SKU · Per-point colour by health zone</div>'
+ +legHTML+tilesHTML
+ +'<div style="position:relative;height:320px"><canvas id="cStock"></canvas></div>'
+ +'<div class="badges" id="badges"></div>'
+ +'<div style="border-top:1px solid #1e3a5f;padding-top:12px;margin-top:14px">'
+ +'<div class="pt" style="margin-bottom:8px">📊 STOCK FILL RATE · % of EOQ · Target 50–150%</div>'
+ +'<div style="position:relative;height:110px"><canvas id="cFill"></canvas></div></div>'
+ +'<div style="border-top:1px solid #1e3a5f;padding-top:12px;margin-top:14px">'
+ +'<div class="pt" style="margin-bottom:8px">⚡ GAP TO REORDER POINT · + = Units Needed · − = Buffer Above ROP</div>'
+ +'<div style="position:relative;height:110px"><canvas id="cGap"></canvas></div></div>';
+root.appendChild(c1);
+
+// Stock chart
+new Chart(document.getElementById('cStock'),{
+  type:'line', plugins:[zoneBands],
+  data:{
+    labels:D.names,
+    datasets:[
+      {label:'Current Stock',data:D.stks,borderColor:'#00cfff',borderWidth:2.5,
+       tension:.38,fill:false,pointBackgroundColor:D.ptcols,pointBorderColor:D.ptcols,
+       pointRadius:7,pointHoverRadius:10,pointBorderWidth:2,animation:false},
+      {label:'Reorder Point',data:D.rops,borderColor:'#ffbb00',borderWidth:1.8,
+       borderDash:[6,4],tension:.25,fill:false,pointRadius:4,pointHoverRadius:7,
+       pointBackgroundColor:'#ffbb00',animation:false},
+      {label:'EOQ Target',data:D.eoqs,borderColor:'#00ff88',borderWidth:1.8,
+       borderDash:[8,5],tension:.25,fill:false,pointRadius:4,pointHoverRadius:7,
+       pointBackgroundColor:'#00ff88',animation:false},
+      {label:'2×EOQ Overstock',data:D.ovts,borderColor:'#a855f7',borderWidth:1.4,
+       borderDash:[3,6],tension:.25,fill:false,pointRadius:3,animation:false},
+      {label:'½ ROP Critical',data:D.hrops,borderColor:'rgba(255,51,102,.55)',borderWidth:1.2,
+       borderDash:[2,8],tension:.25,fill:false,pointRadius:2,animation:false},
     ]
-  }},
-  options: {{
-    responsive: true,
-    maintainAspectRatio: false,
-    animation: false,
-    interaction: {{ mode:'index', intersect:false }},
-    plugins: {{
-      legend: {{
-        display: true,
-        position: 'top',
-        labels: {{
-          color: LABEL_CLR, boxWidth: 16, padding: 16,
-          usePointStyle: true, pointStyleWidth: 12,
-          font: {{ size: 11 }},
-        }}
-      }},
-      tooltip: {{
-        backgroundColor: 'rgba(10,14,26,0.96)',
-        borderColor: '#1e3a5f',
-        borderWidth: 1,
-        titleColor: '#7dd3fc',
-        bodyColor: '#cbd5e1',
-        padding: 12,
-        callbacks: {{
-          title: ctx => '📦 ' + ctx[0].label,
-          afterBody: ctx => {{
-            const i = ctx[0].dataIndex;
-            const z   = zones[i];
-            const col = zoneColor(z);
-            return [
-              '',
-              `  Zone      : ${{z}}`,
-              `  Stock     : ${{stocks[i]}} units`,
-              `  ROP       : ${{rops[i]}} units  (gap: ${{gapToRop[i]>0?'+':''}}${{gapToRop[i]}})`,
-              `  EOQ       : ${{eoqs[i]}} units`,
-              `  Fill Rate : ${{ratiosPct[i]}}% of EOQ`,
-              `  Days Cover: ~${{daysCover[i]}} days`,
-              `  Order Qty : ${{orderQtys[i]}} units to reach EOQ`,
+  },
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'index',intersect:false},
+    plugins:{
+      legend:{labels:{color:LC,boxWidth:14,font:{size:10},usePointStyle:true}},
+      tooltip:{
+        backgroundColor:'rgba(10,14,26,.96)',borderColor:'#1e3a5f',borderWidth:1,
+        titleColor:LC,bodyColor:'#cbd5e1',padding:11,
+        callbacks:{
+          title:ctx=>'📦 '+ctx[0].label,
+          afterBody:ctx=>{
+            const i=ctx[0].dataIndex;
+            return['',
+              '  Zone       : '+D.zones[i],
+              '  Stock      : '+D.stks[i]+' units',
+              '  ROP        : '+D.rops[i]+'  (gap: '+(D.gaps[i]>0?'+':'')+D.gaps[i]+')',
+              '  EOQ        : '+D.eoqs[i],
+              '  Fill Rate  : '+D.fills[i]+'% of EOQ',
+              '  Days Cover : ~'+D.dcovs[i]+' days',
+              '  Order Qty  : '+D.ordqs[i]+' units to reach EOQ',
             ];
-          }}
-        }}
-      }}
-    }},
-    scales: {{
-      x: {{
-        grid: {{ color: GRID_CLR }},
-        ticks: {{
-          color: ctx => zoneColor(zones[ctx.index] || 'HEALTHY'),
-          maxRotation: 32,
-          font: {{ size: 10, weight: '600' }},
-        }},
-        title: {{ display:true, text:'SKU', color:LABEL_CLR, font:{{size:11}} }}
-      }},
-      y: {{
-        grid: {{ color: GRID_CLR }},
-        ticks: {{ color: TEXT_CLR }},
-        title: {{ display:true, text:'Units in Stock', color:LABEL_CLR, font:{{size:11}} }},
-        beginAtZero: true,
-      }}
-    }}
-  }}
-}});
+          }
+        }
+      }
+    },
+    scales:{
+      x:{grid:{color:GC},ticks:{color:ctx=>zCol(D.zones[ctx.index]||'Healthy'),maxRotation:32,font:{size:10,weight:'600'}}},
+      y:{grid:{color:GC},ticks:{color:TC},beginAtZero:true,title:{display:true,text:'Units',color:LC}}
+    }
+  }
+});
 
-// ── 2b. STOCK FILL-RATE LINE CHART ─────────────────────────────────────────
-// Fill rate = stocks[i] / eoqs[i] * 100
-// Target band: 50%–150%
-const fillRateBandPlugin = {{
-  id: 'fillBand',
-  beforeDraw(chart) {{
-    const {{ctx, chartArea:{{left,right,top,bottom}}, scales:{{y}}}} = chart;
-    if (!y) return;
-    const y50  = y.getPixelForValue(50);
-    const y150 = y.getPixelForValue(150);
-    ctx.save();
-    // Target zone band (50-150%)
-    ctx.fillStyle = 'rgba(0,255,136,0.07)';
-    ctx.fillRect(left, y150, right-left, y50-y150);
-    // 100% reference line
-    const y100 = y.getPixelForValue(100);
-    ctx.strokeStyle = 'rgba(0,207,255,0.4)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([5,5]);
-    ctx.beginPath(); ctx.moveTo(left,y100); ctx.lineTo(right,y100); ctx.stroke();
-    ctx.restore();
-  }}
+// Fill rate chart
+const frBand={id:'frb',beforeDraw(chart){
+  const {ctx,chartArea:{left,right,top,bottom},scales:{y}}=chart;
+  if(!y) return;
+  const y50=y.getPixelForValue(50),y150=y.getPixelForValue(150),y100=y.getPixelForValue(100);
+  ctx.save();
+  ctx.fillStyle='rgba(0,255,136,.07)';
+  ctx.fillRect(left,Math.min(y50,y150),right-left,Math.abs(y50-y150));
+  ctx.strokeStyle='rgba(0,207,255,.35)';ctx.lineWidth=1;ctx.setLineDash([5,5]);
+  ctx.beginPath();ctx.moveTo(left,y100);ctx.lineTo(right,y100);ctx.stroke();
+  ctx.restore();
 }};
+new Chart(document.getElementById('cFill'),{
+  type:'line',plugins:[frBand],
+  data:{labels:D.names,datasets:[{
+    label:'Fill Rate %',data:D.fills,borderColor:'#00cfff',borderWidth:2,
+    tension:.38,fill:true,backgroundColor:'rgba(0,207,255,.06)',
+    pointBackgroundColor:D.ptcols,pointBorderColor:D.ptcols,pointRadius:5,
+    pointHoverRadius:8,animation:false
+  }]},
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'index',intersect:false},
+    plugins:{legend:{labels:{color:LC,boxWidth:12}},
+      tooltip:{backgroundColor:'rgba(10,14,26,.96)',borderColor:'#1e3a5f',borderWidth:1,
+        titleColor:LC,bodyColor:'#cbd5e1',
+        callbacks:{title:ctx=>ctx[0].label,
+          label:ctx=>'  Fill Rate: '+ctx.raw+'%  (target 50–150%)',
+          afterLabel:ctx=>'  EOQ: '+D.eoqs[ctx.dataIndex]+'u  Stock: '+D.stks[ctx.dataIndex]+'u'
+        }
+      }
+    },
+    scales:{
+      x:{grid:{color:GC},ticks:{color:TC,font:{size:9},maxRotation:30}},
+      y:{grid:{color:GC},ticks:{color:TC},beginAtZero:true,title:{display:true,text:'% of EOQ',color:LC}}
+    }
+  }
+});
 
-new Chart(document.getElementById('fillRateChart'), {{
-  type: 'line',
-  plugins: [fillRateBandPlugin],
-  data: {{
-    labels: names,
-    datasets: [{{
-      label: 'Fill Rate %',
-      data: ratiosPct,
-      borderColor: '#00cfff',
-      borderWidth: 2,
-      tension: 0.38,
-      fill: true,
-      backgroundColor: ctx => {{
-        const chart = ctx.chart;
-        const {{ctx:c, chartArea}} = chart;
-        if (!chartArea) return 'transparent';
-        const grad = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
-        grad.addColorStop(0, 'rgba(0,207,255,0.25)');
-        grad.addColorStop(1, 'rgba(0,207,255,0.02)');
-        return grad;
-      }},
-      pointBackgroundColor: ptColors,
-      pointBorderColor: ptColors,
-      pointRadius: 5,
-      pointHoverRadius: 8,
-      animation: false,
-    }}]
-  }},
-  options: {{
-    responsive:true, maintainAspectRatio:false,
-    animation: false,
-    interaction: {{ mode:'index', intersect:false }},
-    plugins: {{
-      legend: {{ labels:{{ color:LABEL_CLR, boxWidth:12 }} }},
-      tooltip: {{
-        backgroundColor:'rgba(10,14,26,0.96)', borderColor:'#1e3a5f', borderWidth:1,
-        titleColor:'#7dd3fc', bodyColor:'#cbd5e1',
-        callbacks: {{
-          title: ctx => ctx[0].label,
-          label: ctx => `  Fill Rate: ${{ctx.raw}}%  (target: 50–150%)`,
-          afterLabel: ctx => `  EOQ: ${{eoqs[ctx.dataIndex]}}u  |  Stock: ${{stocks[ctx.dataIndex]}}u`,
-        }}
-      }}
-    }},
-    scales: {{
-      x: {{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR, font:{{size:9}}, maxRotation:30}} }},
-      y: {{
-        grid: {{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
-        title: {{display:true, text:'% of EOQ', color:LABEL_CLR}},
-        beginAtZero: true,
-      }}
-    }}
-  }}
-}});
-
-// ── 2c. GAP-TO-ROP LINE CHART ──────────────────────────────────────────────
-// positive gap → stock below ROP → need to order
-// negative gap → stock above ROP → buffer
-const gapColors = gapToRop.map(g => g > 0 ? '#ff3366' : '#00ff88');
-new Chart(document.getElementById('gapChart'), {{
-  type: 'line',
-  data: {{
-    labels: names,
-    datasets: [{{
-      label: 'Gap to ROP',
-      data: gapToRop,
-      borderColor: '#7dd3fc',
-      borderWidth: 2,
-      tension: 0.35,
-      fill: ctx => ctx.p0.parsed.y >= 0 ? 'origin' : '-1',
-      backgroundColor: ctx => {{
-        const chart = ctx.chart;
-        const {{ctx:c, chartArea}} = chart;
-        if (!chartArea) return 'transparent';
-        const grad = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
-        grad.addColorStop(0, 'rgba(255,51,102,0.20)');
-        grad.addColorStop(0.5,'rgba(255,51,102,0.05)');
-        grad.addColorStop(1, 'rgba(0,255,136,0.10)');
-        return grad;
-      }},
-      pointBackgroundColor: gapColors,
-      pointBorderColor: gapColors,
-      pointRadius: 5,
-      pointHoverRadius: 8,
-      animation: false,
-    }},
-    {{
-      label: 'Zero Line',
-      data: names.map(()=>0),
-      borderColor: 'rgba(255,255,255,0.15)',
-      borderWidth: 1,
-      borderDash: [4,4],
-      pointRadius: 0,
-      fill: false,
-    }}]
-  }},
-  options: {{
-    responsive:true, maintainAspectRatio:false,
-    animation: false,
-    interaction: {{ mode:'index', intersect:false }},
-    plugins: {{
-      legend: {{ labels:{{ color:LABEL_CLR, boxWidth:12 }} }},
-      tooltip: {{
-        backgroundColor:'rgba(10,14,26,0.96)', borderColor:'#1e3a5f', borderWidth:1,
-        titleColor:'#7dd3fc', bodyColor:'#cbd5e1',
-        callbacks: {{
-          title: ctx => ctx[0].label,
-          label: ctx => {{
+// Gap chart
+const gCols=D.gaps.map(g=>g>0?'#ff3366':'#00ff88');
+new Chart(document.getElementById('cGap'),{
+  type:'line',
+  data:{labels:D.names,datasets:[
+    {label:'Gap to ROP',data:D.gaps,borderColor:'#7dd3fc',borderWidth:2,tension:.35,
+     fill:false,pointBackgroundColor:gCols,pointBorderColor:gCols,pointRadius:5,
+     pointHoverRadius:8,animation:false},
+    {label:'Zero',data:D.names.map(()=>0),borderColor:'rgba(255,255,255,.15)',
+     borderDash:[4,4],borderWidth:1,pointRadius:0,fill:false}
+  ]},
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'index',intersect:false},
+    plugins:{legend:{labels:{color:LC,boxWidth:12}},
+      tooltip:{backgroundColor:'rgba(10,14,26,.96)',borderColor:'#1e3a5f',borderWidth:1,
+        titleColor:LC,bodyColor:'#cbd5e1',
+        callbacks:{title:ctx=>ctx[0].label,
+          label:ctx=>{
             if(ctx.datasetIndex===1) return null;
-            const g = ctx.raw;
-            return g > 0
-              ? `  ⚠️ Below ROP by ${{g}} units — order needed`
-              : `  ✅ Above ROP by ${{Math.abs(g)}} units — buffer OK`;
-          }},
-          afterLabel: ctx => {{
+            const g=ctx.raw;
+            return g>0?'  ⚠️ Below ROP by '+g+' units':'  ✅ Above ROP by '+Math.abs(g)+' units';
+          },
+          afterLabel:ctx=>{
             if(ctx.datasetIndex===1) return null;
-            const i = ctx.dataIndex;
-            return `  Order to EOQ: ${{orderQtys[i]}} units  |  ~${{daysCover[i]}} days cover`;
-          }}
-        }}
-      }}
-    }},
-    scales: {{
-      x: {{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR, font:{{size:9}}, maxRotation:30}} }},
-      y: {{
-        grid: {{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
-        title: {{display:true, text:'Units Gap (+ = need, − = buffer)', color:LABEL_CLR}},
-      }}
-    }}
-  }}
-}});
+            const i=ctx.dataIndex;
+            return '  Order to EOQ: '+D.ordqs[i]+'u  |  ~'+D.dcovs[i]+'d cover';
+          }
+        }
+      }
+    },
+    scales:{
+      x:{grid:{color:GC},ticks:{color:TC,font:{size:9},maxRotation:30}},
+      y:{grid:{color:GC},ticks:{color:TC},title:{display:true,text:'Gap (+ need, − buffer)',color:LC}}
+    }
+  }
+});
 
-// ── 2d. PER-SKU BADGE STRIP ────────────────────────────────────────────────
-const badgeEl = document.getElementById('skuBadgeStrip');
-names.forEach((n, i) => {{
-  const z   = zones[i];
-  const col = zoneColor(z);
-  const bg  = zoneBg(z);
-  const zIcon = z==='CRITICAL'?'🔴':z==='LOW'?'🟡':z==='OVERSTOCK'?'🟣':'🟢';
-  badgeEl.innerHTML += `
-  <div class="sku-badge" style="background:${{bg}};border-left-color:${{col}};">
-    <div class="sku-badge-name">${{n}}</div>
-    <div class="sku-badge-zone" style="color:${{col}}">${{zIcon}} ${{z}}</div>
-    <div style="font-size:.60rem;color:#94a3b8;margin-bottom:3px;">${{catShort[i]}}</div>
-    <div class="sku-badge-row"><span>Stock</span><span class="sku-badge-val">${{stocks[i]}}</span></div>
-    <div class="sku-badge-row"><span>ROP</span><span class="sku-badge-val">${{rops[i]}}</span></div>
-    <div class="sku-badge-row"><span>EOQ</span><span class="sku-badge-val">${{eoqs[i]}}</span></div>
-    <div class="sku-badge-row"><span>Fill</span><span class="sku-badge-val" style="color:${{col}}">${{ratiosPct[i]}}%</span></div>
-    <div class="sku-badge-row"><span>Cover</span><span class="sku-badge-val">~${{daysCover[i]}}d</span></div>
-    <div class="sku-badge-row"><span>Order</span><span class="sku-badge-val" style="color:${{orderQtys[i]>0?'#f97316':'#00ff88'}}">${{orderQtys[i]===0?'—':orderQtys[i]+' u'}}</span></div>
-  </div>`;
-}});
+// Badge strip
+const badgeEl=document.getElementById('badges');
+D.names.forEach((n,i)=>{
+  const z=D.zones[i],col=zCol(z),bg=zBg(z);
+  const zi=z==='Critical'?'🔴':z==='Watch'?'🟡':z==='Overstock'?'🟣':'🟢';
+  badgeEl.innerHTML+='<div class="badge" style="background:'+bg+';border-left-color:'+col+';">'
+    +'<div class="bn">'+n+'</div>'
+    +'<div class="bz" style="color:'+col+'">'+zi+' '+z+'</div>'
+    +'<div class="br"><span>Stock</span><span class="bv">'+D.stks[i]+'</span></div>'
+    +'<div class="br"><span>ROP</span><span class="bv">'+D.rops[i]+'</span></div>'
+    +'<div class="br"><span>EOQ</span><span class="bv">'+D.eoqs[i]+'</span></div>'
+    +'<div class="br"><span>Fill</span><span class="bv" style="color:'+col+'">'+D.fills[i]+'%</span></div>'
+    +'<div class="br"><span>Cover</span><span class="bv">~'+D.dcovs[i]+'d</span></div>'
+    +'<div class="br"><span>Order</span><span class="bv" style="color:'+(D.ordqs[i]>0?'#f97316':'#00ff88')+'">'+(D.ordqs[i]===0?'—':D.ordqs[i]+' u')+'</span></div>'
+    +'</div>';
+});
+</script></body></html>"""
 
-// ── 3. Radar Chart ─────────────────────────────────────────────────────────
-const radarDatasets = {radar_datasets_js};
-new Chart(document.getElementById('radarChart'), {{
-  type:'radar',
-  data:{{
-    labels:['Stock\\nScore','Expiry\\nScore','Margin\\nScore','Order\\nReadiness','Stock\\nRatio×50'],
-    datasets: radarDatasets
-  }},
-  options:{{
-    responsive:true, maintainAspectRatio:false,
-    plugins:{{ legend:{{ labels:{{ color:LABEL_CLR, boxWidth:12, font:{{size:10}} }} }} }},
-    scales:{{ r:{{
-      min:0, max:100,
-      grid:{{ color:GRID_CLR }},
-      angleLines:{{ color:GRID_CLR }},
-      pointLabels:{{ color:LABEL_CLR, font:{{size:10}} }},
-      ticks:{{ color:TEXT_CLR, backdropColor:'transparent', stepSize:25 }}
-    }} }}
-  }}
-}});
+        components.html(_iframe1, height=1720, scrolling=False)
 
-// ── 4. Bubble: Health vs Margin ────────────────────────────────────────────
-const bubbleDatasets = scatterRaw.map((p,i) => ({{
-  label: p.label,
-  data: [{{ x:p.x, y:p.y, r:p.r }}],
-  backgroundColor: barColors[i] + '99',
-  borderColor: barColors[i],
-  borderWidth:1.5
-}}));
-new Chart(document.getElementById('bubbleChart'), {{
-  type:'bubble',
-  data:{{ datasets: bubbleDatasets }},
-  options:{{
-    responsive:true, maintainAspectRatio:false,
-    plugins:{{
-      legend:{{ labels:{{ color:LABEL_CLR, boxWidth:10, font:{{size:9}} }} }},
-      tooltip:{{
-        callbacks:{{
-          label: ctx => `${{ctx.dataset.label}}  Margin:${{ctx.raw.x}}%  Health:${{ctx.raw.y}}/100`
-        }}
-      }}
-    }},
-    scales:{{
-      x:{{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
-           title:{{display:true,text:'Gross Margin %',color:LABEL_CLR}} }},
-      y:{{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
-           min:0, max:100,
-           title:{{display:true,text:'Health Score',color:LABEL_CLR}} }}
-    }}
-  }}
-}});
+        # ══════════════════════════════════════════════════════════════════════
+        # IFRAME 2 — Radar · Donut · Health-vs-Margin · Urgency · Expiry · ABC
+        # ══════════════════════════════════════════════════════════════════════
 
-// ── 5. Donut: Portfolio Status ─────────────────────────────────────────────
-const donutColors = ['#00ff88','#ffbb00','#ff3366','#a855f7'];
-new Chart(document.getElementById('donutChart'), {{
+        # Top-6 SKUs for radar (by health score)
+        _top6  = sorted(_rows, key=lambda r: -r["health"])[:6]
+        _r_names = [r["name"][:11]  for r in _top6]
+        _r_ss    = [r["ss"]         for r in _top6]
+        _r_es    = [r["es"]         for r in _top6]
+        _r_ms    = [round(r["ms"],1)for r in _top6]
+        _r_ord   = [100-r["urgency"]for r in _top6]
+        _r_ratio = [min(int(r["ratio"]*50),100) for r in _top6]
+        _r_cols  = [_hcol(r)        for r in _top6]
+
+        # Donut
+        _d_labels = list(_cat_counts.keys())
+        _d_vals   = list(_cat_counts.values())
+        _d_total  = sum(_d_vals)
+
+        # Health vs Margin scatter (all SKUs)
+        _hm_names = [r["name"][:10]         for r in _rows]
+        _hm_x     = [r["margin"]            for r in _rows]
+        _hm_y     = [r["health"]            for r in _rows]
+        _hm_r     = [max(r["stk"]//8, 4)   for r in _rows]
+        _hm_cols  = [_hcol(r)               for r in _rows]
+
+        # Margin line (sorted low→high)
+        _mr_s    = sorted(_rows, key=lambda r: r["margin"])
+        _mr_names= [r["name"][:11]  for r in _mr_s]
+        _mr_vals = [r["margin"]     for r in _mr_s]
+        _mr_sells= [r["sell"]       for r in _mr_s]
+        _mr_costs= [r["cost"]       for r in _mr_s]
+        _mr_cols = [_hcol(r)        for r in _mr_s]
+
+        # ABC classification (by margin × stock value)
+        _abc_s  = sorted(_rows, key=lambda r: -(r["margin"] * r["stk"]))
+        _a_cut  = max(1, len(_abc_s) // 5)
+        _b_cut  = max(2, len(_abc_s) // 2)
+        _a_items= ", ".join(r["name"].split()[0] for r in _abc_s[:_a_cut])
+        _b_items= ", ".join(r["name"].split()[0] for r in _abc_s[_a_cut:_b_cut])
+        _c_items= ", ".join(r["name"].split()[0] for r in _abc_s[_b_cut:])
+
+        # Expiry (sorted urgent first)
+        _ex_s   = sorted(_rows, key=lambda r: r["exp"])
+        _ex_names= [r["name"][:11]  for r in _ex_s]
+        _ex_vals = [r["exp"]        for r in _ex_s]
+        _ex_cols = [
+            "#ff3366" if r["exp"] <= 3 else
+            "#ffbb00" if r["exp"] <= 7 else
+            "#00cfff" if r["exp"] <= 30 else "#00ff88"
+            for r in _ex_s
+        ]
+
+        # Urgency (sorted high→low)
+        _ug_s    = sorted(_rows, key=lambda r: -r["urgency"])
+        _ug_names= [r["name"][:11]  for r in _ug_s]
+        _ug_vals = [r["urgency"]    for r in _ug_s]
+        _ug_stk  = [r["stk"]        for r in _ug_s]
+        _ug_rop  = [r["rop"]        for r in _ug_s]
+        _ug_cols = [
+            "#ff3366" if v >= 70 else
+            "#ffbb00" if v >= 30 else "#00ff88"
+            for v in _ug_vals
+        ]
+
+        # Trend line for scatter (simple linear regression)
+        _n = len(_hm_x)
+        _sx  = sum(_hm_x); _sy = sum(_hm_y)
+        _sx2 = sum(v*v for v in _hm_x)
+        _sxy = sum(_hm_x[i]*_hm_y[i] for i in range(_n))
+        _denom = (_n * _sx2 - _sx * _sx) or 1
+        _slope = (_n * _sxy - _sx * _sy) / _denom
+        _inter = (_sy - _slope * _sx) / _n
+        _tx_min = round(min(_hm_x) - 3, 1)
+        _tx_max = round(max(_hm_x) + 3, 1)
+        _ty_min = round(max(0, _slope * _tx_min + _inter), 1)
+        _ty_max = round(min(100, _slope * _tx_max + _inter), 1)
+
+        _i2_data = {
+            "ts": _now_ts,
+            "rNames": _r_names, "rSS": _r_ss, "rES": _r_es, "rMS": _r_ms,
+            "rOrd": _r_ord, "rRatio": _r_ratio, "rCols": _r_cols,
+            "dLabels": _d_labels, "dVals": _d_vals, "dTotal": _d_total,
+            "hmNames": _hm_names, "hmX": _hm_x, "hmY": _hm_y,
+            "hmR": _hm_r, "hmCols": _hm_cols,
+            "txMin": _tx_min, "txMax": _tx_max, "tyMin": _ty_min, "tyMax": _ty_max,
+            "mrNames": _mr_names, "mrVals": _mr_vals,
+            "mrSells": _mr_sells, "mrCosts": _mr_costs, "mrCols": _mr_cols,
+            "exNames": _ex_names, "exVals": _ex_vals, "exCols": _ex_cols,
+            "ugNames": _ug_names, "ugVals": _ug_vals,
+            "ugStk": _ug_stk, "ugRop": _ug_rop, "ugCols": _ug_cols,
+            "aItems": _a_items or "—", "bItems": _b_items or "—",
+            "cItems": _c_items or "—",
+        }
+        _i2_json = _json.dumps(_i2_data)
+
+        _iframe2 = """<!DOCTYPE html><html><head>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0e1a;color:#e0e8ff;font-family:'Segoe UI',monospace,sans-serif;padding:14px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.g3{display:grid;grid-template-columns:1.4fr 1fr;gap:14px;margin-bottom:14px}
+.panel{background:linear-gradient(135deg,#0d1224,#111827);border:1px solid #1e3a5f;
+  border-radius:12px;padding:14px;position:relative;overflow:hidden}
+.panel::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,#00ff88,#00cfff,#a855f7)}
+.pt{font-size:.72rem;font-weight:700;color:#7dd3fc;letter-spacing:.7px;
+    text-transform:uppercase;margin-bottom:6px}
+.sub{font-size:.60rem;color:#94a3b8;margin-bottom:10px}
+canvas{max-width:100%}
+.hrow{display:flex;align-items:center;gap:7px;margin:5px 0}
+.hl{width:105px;font-size:.64rem;color:#cbd5e1;flex-shrink:0;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ht{flex:1;height:13px;background:#1e2a3a;border-radius:7px;overflow:hidden}
+.hf{height:100%;border-radius:7px}
+.hv{width:36px;font-size:.62rem;text-align:right;flex-shrink:0;font-weight:700}
+.htag{width:46px;font-size:.58rem;text-align:right;flex-shrink:0}
+.dleg{margin-top:8px}
+.dr{display:flex;align-items:center;gap:6px;font-size:.66rem;margin:3px 0}
+.dd{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.abc{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:10px}
+.ac{background:#0a0e1a;border-radius:8px;padding:8px;text-align:center;border:1px solid #1e3a5f}
+.al{font-size:1.4rem;font-weight:900}
+.alb{font-size:.58rem;color:#94a3b8;margin-top:2px}
+.ai{font-size:.60rem;color:#cbd5e1;margin-top:3px;line-height:1.4}
+.ql{position:absolute;font-size:.58rem;font-weight:700;letter-spacing:.3px;
+    opacity:.45;pointer-events:none}
+</style></head><body>
+<script>
+const D=""" + _i2_json + """;
+const GC='rgba(30,58,95,0.6)',LC='#7dd3fc',TC='#94a3b8';
+Chart.defaults.color=TC;
+Chart.defaults.font.family="'Segoe UI',monospace";
+Chart.defaults.font.size=11;
+const dColors=['#00ff88','#ffbb00','#ff3366','#a855f7'];
+
+// ── Section header ────────────────────────────────────────────────────
+document.write('<div style="display:flex;justify-content:space-between;'
+  +'align-items:center;margin-bottom:12px;">'
+  +'<div style="font-size:.68rem;color:#7dd3fc;font-weight:700;letter-spacing:.5px;">'
+  +'📊 INVENTORY INTELLIGENCE SUITE  ·  6 PANELS</div>'
+  +'<div style="font-size:.62rem;color:#475569;">🕐 '+D.ts+'</div></div>');
+
+// ══════════════════════════════════════════════════════════════════════
+// ROW 1: Radar-as-Line + Donut
+// ══════════════════════════════════════════════════════════════════════
+document.write('<div class="g2"><div class="panel" id="pRadar"></div>'
+              +'<div class="panel" id="pDonut"></div></div>');
+
+// Panel: Multi-dimension line
+const pR = document.getElementById('pRadar');
+pR.innerHTML = '<div class="pt">🕸️ Multi-Dimension Intelligence · Top 6 SKUs by Health Score</div>'
+  +'<div class="sub">Axes: Stock · Expiry · Margin · Order Readiness · Fill Ratio — line per dimension</div>'
+  +'<div style="position:relative;height:280px"><canvas id="cRadar"></canvas></div>';
+new Chart(document.getElementById('cRadar'),{
+  type:'line',
+  data:{
+    labels:D.rNames,
+    datasets:[
+      {label:'Stock Score',data:D.rSS,borderColor:'#00ff88',backgroundColor:'rgba(0,255,136,.07)',
+       borderWidth:2,tension:.35,fill:false,pointRadius:5,pointHoverRadius:8,animation:false},
+      {label:'Expiry Score',data:D.rES,borderColor:'#00cfff',backgroundColor:'rgba(0,207,255,.07)',
+       borderWidth:2,tension:.35,fill:false,pointRadius:5,pointHoverRadius:8,animation:false},
+      {label:'Margin Score',data:D.rMS,borderColor:'#a855f7',backgroundColor:'rgba(168,85,247,.07)',
+       borderWidth:2,tension:.35,fill:false,pointRadius:5,pointHoverRadius:8,animation:false},
+      {label:'Order Readiness',data:D.rOrd,borderColor:'#ffbb00',backgroundColor:'rgba(255,187,0,.07)',
+       borderWidth:2,tension:.35,fill:false,pointRadius:5,pointHoverRadius:8,animation:false},
+      {label:'Fill Ratio×50',data:D.rRatio,borderColor:'#f97316',backgroundColor:'rgba(249,115,22,.07)',
+       borderWidth:2,tension:.35,fill:false,pointRadius:5,pointHoverRadius:8,animation:false},
+    ]
+  },
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'index',intersect:false},
+    plugins:{
+      legend:{labels:{color:LC,boxWidth:12,font:{size:10},usePointStyle:true}},
+      tooltip:{backgroundColor:'rgba(10,14,26,.96)',borderColor:'#1e3a5f',borderWidth:1,
+        titleColor:LC,bodyColor:'#cbd5e1',padding:10,
+        callbacks:{title:ctx=>'📦 '+ctx[0].label}}
+    },
+    scales:{
+      x:{grid:{color:GC},ticks:{color:TC,maxRotation:28,font:{size:9}}},
+      y:{grid:{color:GC},ticks:{color:TC},min:0,max:100,
+         title:{display:true,text:'Score (0–100)',color:LC}}
+    }
+  }
+});
+
+// Panel: Donut
+const pD = document.getElementById('pDonut');
+pD.innerHTML = '<div class="pt">🍩 Portfolio Status Distribution · '+D.dTotal+' SKUs Total</div>'
+  +'<div class="sub">Healthy / Watch / Critical / Overstock — live from DB</div>'
+  +'<div style="position:relative;height:200px"><canvas id="cDonut"></canvas></div>'
+  +'<div class="dleg" id="dLeg"></div>';
+
+const dChart = new Chart(document.getElementById('cDonut'),{
   type:'doughnut',
-  data:{{ labels:catLabels, datasets:[{{ data:catVals,
-    backgroundColor:donutColors.map(c=>c+'cc'),
-    borderColor:donutColors, borderWidth:2,
-    hoverOffset:8
-  }}] }},
-  options:{{
-    responsive:true, maintainAspectRatio:false, cutout:'65%',
-    plugins:{{
-      legend:{{ display:false }},
-      tooltip:{{ callbacks:{{ label: ctx => ` ${{ctx.label}}: ${{ctx.parsed}} SKUs` }} }}
-    }}
-  }},
-  plugins:[{{
-    id:'centerText',
-    beforeDraw(chart) {{
-      const {{ctx,chartArea:{{width,height,top,left}}}} = chart;
-      ctx.save();
-      const cx = left+width/2, cy = top+height/2;
-      const total = catVals.reduce((a,b)=>a+b,0);
-      ctx.font = 'bold 20px Segoe UI';
-      ctx.fillStyle = '#00ff88';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(total, cx, cy-8);
-      ctx.font = '10px Segoe UI';
-      ctx.fillStyle = '#7dd3fc';
-      ctx.fillText('SKUs', cx, cy+10);
-      ctx.restore();
-    }}
-  }}]
-}});
+  data:{labels:D.dLabels,datasets:[{
+    data:D.dVals,backgroundColor:dColors.map(c=>c+'bb'),
+    borderColor:dColors,borderWidth:2,hoverOffset:6
+  }]},
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,cutout:'63%',
+    plugins:{
+      legend:{display:false},
+      tooltip:{callbacks:{label:ctx=>' '+ctx.label+': '+ctx.parsed+' SKUs'}}
+    }
+  }
+});
+// Center text via timeout
+setTimeout(()=>{
+  const ch=dChart,c=ch.ctx,ca=ch.chartArea;
+  if(!ca) return;
+  const cx=ca.left+(ca.right-ca.left)/2, cy=ca.top+(ca.bottom-ca.top)/2;
+  c.save();
+  c.font='bold 22px Segoe UI';c.fillStyle='#00ff88';
+  c.textAlign='center';c.textBaseline='middle';
+  c.fillText(D.dTotal,cx,cy-9);
+  c.font='11px Segoe UI';c.fillStyle=LC;
+  c.fillText('SKUs',cx,cy+10);
+  c.restore();
+},80);
 // Legend
-const legEl = document.getElementById('donutLegend');
-catLabels.forEach((l,i) => {{
-  legEl.innerHTML += `<div style="display:flex;align-items:center;gap:5px;margin:2px 0;font-size:.65rem;">
-    <div style="width:10px;height:10px;border-radius:50%;background:${{donutColors[i]}};flex-shrink:0"></div>
-    <span style="color:#cbd5e1">${{l}}</span>
-    <span style="color:#7dd3fc;margin-left:auto;font-weight:700">${{catVals[i]}}</span>
-  </div>`;
-}});
+const legEl=document.getElementById('dLeg');
+D.dLabels.forEach((l,i)=>{
+  legEl.innerHTML+='<div class="dr"><div class="dd" style="background:'+dColors[i]+'"></div>'
+    +'<span style="color:#cbd5e1">'+l+'</span>'
+    +'<span style="color:'+LC+';margin-left:auto;font-weight:700">'+D.dVals[i]+'</span></div>';
+});
 
-// ── 6. Reorder Urgency Meters ──────────────────────────────────────────────
-const urgEl = document.getElementById('urgencyList');
-const urgSorted = names.map((n,i)=>{{return{{n,u:urgencies[i],s:stocks[i],r:rops[i]}}}})
-                      .sort((a,b)=>b.u-a.u);
-urgSorted.forEach(item => {{
-  const col = item.u>=70?'#ff3366':item.u>=30?'#ffbb00':'#00ff88';
-  urgEl.innerHTML += `
-  <div class="urg-row">
-    <div class="urg-name">${{item.n.substring(0,13)}}</div>
-    <div class="urg-track">
-      <div class="urg-fill" style="width:${{item.u}}%;background:${{col}};transition:width .8s ease;"></div>
-    </div>
-    <div class="urg-pct" style="color:${{col}}">${{item.u}}%</div>
-  </div>`;
-}});
+// ══════════════════════════════════════════════════════════════════════
+// ROW 2: Health vs Margin scatter + Urgency
+// ══════════════════════════════════════════════════════════════════════
+document.write('<div class="g3"><div class="panel" id="pHM"></div>'
+              +'<div class="panel" id="pUrg"></div></div>');
 
-// ── 7. Expiry Timeline ─────────────────────────────────────────────────────
-const expEl = document.getElementById('expiryList');
-const expSorted = names.map((n,i)=>{{return{{n,e:expiryDays[i]}}}})
-                       .sort((a,b)=>a.e-b.e);
-expSorted.forEach(item => {{
-  const pct  = Math.min(item.e/90*100,100);
-  const col  = item.e<=3?'#ff3366':item.e<=7?'#ffbb00':item.e<=30?'#00cfff':'#00ff88';
-  const flag = item.e<=1?'🚨':item.e<=3?'🔴':item.e<=7?'⏰':item.e<=30?'🟡':'🟢';
-  expEl.innerHTML += `
-  <div class="expiry-row">
-    <div class="expiry-name">${{flag}} ${{item.n.substring(0,12)}}</div>
-    <div class="expiry-track">
-      <div class="expiry-fill" style="width:${{pct}}%;background:linear-gradient(90deg,${{col}}aa,${{col}});">
-        <span class="expiry-val">${{item.e}}d</span>
-      </div>
-    </div>
-    <div class="expiry-days" style="color:${{col}}">${{item.e<=3?'URGENT':item.e<=7?'Soon':'OK'}}</div>
-  </div>`;
-}});
+// Health vs Margin
+const pHM = document.getElementById('pHM');
+pHM.innerHTML = '<div class="pt">💹 Health Score vs Gross Margin · Bubble Size = Stock Qty</div>'
+  +'<div class="sub">Top-right = ideal (high margin + healthy stock)  ·  Bottom-left = action needed</div>'
+  +'<div style="position:relative;height:270px">'
+  +'<canvas id="cHM"></canvas>'
+  +'<span class="ql" style="top:14px;right:14px;color:#00ff88">✅ IDEAL</span>'
+  +'<span class="ql" style="bottom:18px;right:14px;color:#ffbb00">⚠️ LOW STOCK</span>'
+  +'<span class="ql" style="top:14px;left:14px;color:#ffbb00">⏰ MARGIN RISK</span>'
+  +'<span class="ql" style="bottom:18px;left:14px;color:#ff3366">🔴 CRITICAL</span>'
+  +'</div>';
 
-// ── 8. Margin Bar Chart ────────────────────────────────────────────────────
-const marginColors = margins.map(m =>
-  m>=25?'rgba(0,255,136,0.8)':m>=12?'rgba(0,207,255,0.8)':
-  m>=0?'rgba(255,187,0,0.8)':'rgba(255,51,102,0.8)'
-);
-new Chart(document.getElementById('marginChart'), {{
-  type:'bar',
-  data:{{
-    labels:names,
-    datasets:[{{
-      label:'Gross Margin %',
-      data:margins,
-      backgroundColor:marginColors,
-      borderColor:marginColors.map(c=>c.replace('0.8','1')),
-      borderWidth:1, borderRadius:5
-    }}]
-  }},
-  options:{{
-    responsive:true, maintainAspectRatio:false, indexAxis:'y',
-    plugins:{{
-      legend:{{display:false}},
-      tooltip:{{callbacks:{{label:ctx=>`Margin: ${{ctx.raw.toFixed(1)}}%`}}}}
-    }},
-    scales:{{
-      x:{{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
-           min:0,
-           title:{{display:true,text:'Gross Margin %',color:LABEL_CLR}} }},
-      y:{{ grid:{{color:'transparent'}}, ticks:{{color:TEXT_CLR,font:{{size:10}}}} }}
-    }}
-  }}
-}});
+const hmDS = D.hmNames.map((nm,i)=>({
+  label:nm,
+  data:[{x:D.hmX[i],y:D.hmY[i],r:D.hmR[i]}],
+  backgroundColor:D.hmCols[i]+'99',
+  borderColor:D.hmCols[i],borderWidth:1.5
+}));
+hmDS.push({
+  label:'Trend',type:'line',
+  data:[{x:D.txMin,y:D.tyMin},{x:D.txMax,y:D.tyMax}],
+  borderColor:'rgba(255,255,255,.18)',borderDash:[4,6],
+  borderWidth:1,pointRadius:0,fill:false
+});
+new Chart(document.getElementById('cHM'),{
+  type:'bubble',data:{datasets:hmDS},
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'nearest',intersect:true},
+    plugins:{
+      legend:{labels:{color:LC,boxWidth:8,font:{size:8}}},
+      tooltip:{backgroundColor:'rgba(10,14,26,.96)',borderColor:'#1e3a5f',borderWidth:1,
+        titleColor:LC,bodyColor:'#cbd5e1',padding:10,
+        callbacks:{
+          title:ctx=>'📦 '+ctx[0].dataset.label,
+          label:ctx=>{
+            if(ctx.dataset.label==='Trend') return null;
+            return['  Margin : '+ctx.raw.x.toFixed(1)+'%',
+                   '  Health : '+ctx.raw.y+' / 100',
+                   '  Stock  : ~'+(ctx.raw.r*8)+' units'];
+          }
+        }
+      }
+    },
+    scales:{
+      x:{grid:{color:GC},ticks:{color:TC},
+         title:{display:true,text:'Gross Margin %',color:LC},
+         min:Math.min(...D.hmX)-5,max:Math.max(...D.hmX)+5},
+      y:{grid:{color:GC},ticks:{color:TC},min:0,max:100,
+         title:{display:true,text:'Health Score (0–100)',color:LC}}
+    }
+  }
+});
 
-// ── 9. ABC Classification ─────────────────────────────────────────────────
-// A = top 20% by margin×stock_val, B = next 30%, C = rest
-const abcScored = names.map((n,i)=>{{return{{n,v:margins[i]*stocks[i]}}}})
-                       .sort((a,b)=>b.v-a.v);
-const total_n = abcScored.length;
-const a_cut = Math.ceil(total_n*0.20);
-const b_cut = Math.ceil(total_n*0.50);
-const aItems = abcScored.slice(0,a_cut).map(x=>x.n.split(' ')[0]).join(', ');
-const bItems = abcScored.slice(a_cut,b_cut).map(x=>x.n.split(' ')[0]).join(', ');
-const cItems = abcScored.slice(b_cut).map(x=>x.n.split(' ')[0]).join(', ');
-document.getElementById('abcGrid').innerHTML = `
-  <div class="abc-cell">
-    <div class="abc-letter" style="color:#00ff88">A</div>
-    <div class="abc-label">High Value (Top 20%)</div>
-    <div class="abc-items">${{aItems||'—'}}</div>
-  </div>
-  <div class="abc-cell">
-    <div class="abc-letter" style="color:#00cfff">B</div>
-    <div class="abc-label">Medium Value</div>
-    <div class="abc-items">${{bItems||'—'}}</div>
-  </div>
-  <div class="abc-cell">
-    <div class="abc-letter" style="color:#94a3b8">C</div>
-    <div class="abc-label">Low Value (Bottom 50%)</div>
-    <div class="abc-items">${{cItems||'—'}}</div>
-  </div>`;
-</script>
-</body></html>"""
+// Urgency panel
+const pUrg = document.getElementById('pUrg');
+pUrg.innerHTML = '<div class="pt">⚡ Reorder Urgency · Sorted High → Low</div>'
+  +'<div class="sub">0% = safe buffer · 100% = stockout imminent</div>'
+  +'<div id="urgList"></div>'
+  +'<div style="border-top:1px solid #1e3a5f;padding-top:10px;margin-top:10px">'
+  +'<div style="font-size:.62rem;color:#7dd3fc;margin-bottom:6px">URGENCY TREND LINE</div>'
+  +'<div style="position:relative;height:120px"><canvas id="cUrg"></canvas></div></div>';
+const urgEl=document.getElementById('urgList');
+D.ugNames.forEach((nm,i)=>{
+  const col=D.ugCols[i];
+  const tag=D.ugVals[i]>=70?'ORDER NOW':D.ugVals[i]>=30?'Watch':'OK';
+  urgEl.innerHTML+='<div class="hrow">'
+    +'<div class="hl">'+nm+'</div>'
+    +'<div class="ht"><div class="hf" style="width:'+D.ugVals[i]+'%;background:'+col+'"></div></div>'
+    +'<div class="hv" style="color:'+col+'">'+D.ugVals[i]+'%</div>'
+    +'<div class="htag" style="color:'+col+'">'+tag+'</div>'
+    +'</div>';
+});
+new Chart(document.getElementById('cUrg'),{
+  type:'line',
+  data:{labels:D.ugNames,datasets:[
+    {label:'Urgency %',data:D.ugVals,borderColor:'#ff3366',
+     backgroundColor:'rgba(255,51,102,.08)',borderWidth:2,tension:.35,fill:true,
+     pointBackgroundColor:D.ugCols,pointBorderColor:D.ugCols,
+     pointRadius:5,pointHoverRadius:8,animation:false},
+    {label:'0%',data:D.ugNames.map(()=>0),borderColor:'rgba(0,255,136,.2)',
+     borderDash:[3,5],borderWidth:1,pointRadius:0,fill:false}
+  ]},
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'index',intersect:false},
+    plugins:{legend:{labels:{color:LC,boxWidth:10,font:{size:9}}},
+      tooltip:{backgroundColor:'rgba(10,14,26,.96)',borderColor:'#1e3a5f',borderWidth:1,
+        titleColor:LC,bodyColor:'#cbd5e1',
+        callbacks:{title:ctx=>'⚡ '+ctx[0].label,
+          label:ctx=>ctx.datasetIndex===1?null:'  Urgency: '+ctx.raw+'%',
+          afterLabel:ctx=>{
+            if(ctx.datasetIndex===1) return null;
+            const i=ctx.dataIndex;
+            return'  Stock: '+D.ugStk[i]+'  ROP: '+D.ugRop[i];
+          }
+        }
+      }
+    },
+    scales:{
+      x:{grid:{color:GC},ticks:{color:TC,font:{size:8},maxRotation:30}},
+      y:{grid:{color:GC},ticks:{color:TC},min:0,max:100,
+         title:{display:true,text:'Urgency %',color:LC,font:{size:9}}}
+    }
+  }
+});
 
-        components.html(inv_dashboard_html, height=1560, scrolling=True)
+// ══════════════════════════════════════════════════════════════════════
+// ROW 3: Expiry + Margin+ABC
+// ══════════════════════════════════════════════════════════════════════
+document.write('<div class="g2"><div class="panel" id="pExp"></div>'
+              +'<div class="panel" id="pMar"></div></div>');
+
+// Expiry panel
+const pExp = document.getElementById('pExp');
+pExp.innerHTML = '<div class="pt">⏰ Expiry Countdown · Days Remaining (capped 90d) · Urgent First</div>'
+  +'<div class="sub">🚨 &lt;3d · ⏰ &lt;7d · 🟡 &lt;30d · 🟢 Safe</div>'
+  +'<div id="expList"></div>'
+  +'<div style="border-top:1px solid #1e3a5f;padding-top:10px;margin-top:10px">'
+  +'<div style="font-size:.62rem;color:#7dd3fc;margin-bottom:6px">EXPIRY LINE CHART</div>'
+  +'<div style="position:relative;height:130px"><canvas id="cExp"></canvas></div></div>';
+const expEl=document.getElementById('expList');
+D.exNames.forEach((nm,i)=>{
+  const col=D.exCols[i];
+  const pct=Math.min(D.exVals[i]/90*100,100);
+  const flag=D.exVals[i]<=1?'🚨':D.exVals[i]<=3?'🔴':D.exVals[i]<=7?'⏰':D.exVals[i]<=30?'🟡':'🟢';
+  const tag=D.exVals[i]<=3?'URGENT':D.exVals[i]<=7?'Soon':D.exVals[i]<=30?'Watch':'OK';
+  expEl.innerHTML+='<div class="hrow">'
+    +'<div class="hl">'+flag+' '+nm+'</div>'
+    +'<div class="ht"><div class="hf" style="width:'+pct+'%;'
+    +'background:linear-gradient(90deg,'+col+'88,'+col+')"></div></div>'
+    +'<div class="hv" style="color:'+col+'">'+D.exVals[i]+'d</div>'
+    +'<div class="htag" style="color:'+col+'">'+tag+'</div>'
+    +'</div>';
+});
+new Chart(document.getElementById('cExp'),{
+  type:'line',
+  data:{labels:D.exNames,datasets:[
+    {label:'Days to Expiry',data:D.exVals,borderColor:'#00cfff',
+     backgroundColor:'rgba(0,207,255,.07)',borderWidth:2,tension:.35,fill:true,
+     pointBackgroundColor:D.exCols,pointBorderColor:D.exCols,
+     pointRadius:5,pointHoverRadius:8,animation:false},
+    {label:'7d Warning',data:D.exNames.map(()=>7),borderColor:'rgba(255,187,0,.35)',
+     borderDash:[4,5],borderWidth:1,pointRadius:0,fill:false},
+    {label:'3d Critical',data:D.exNames.map(()=>3),borderColor:'rgba(255,51,102,.45)',
+     borderDash:[2,6],borderWidth:1,pointRadius:0,fill:false}
+  ]},
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'index',intersect:false},
+    plugins:{legend:{labels:{color:LC,boxWidth:10,font:{size:9}}},
+      tooltip:{backgroundColor:'rgba(10,14,26,.96)',borderColor:'#1e3a5f',borderWidth:1,
+        titleColor:LC,bodyColor:'#cbd5e1',
+        callbacks:{title:ctx=>'⏰ '+ctx[0].label,
+          label:ctx=>{
+            if(ctx.datasetIndex>0) return'  '+ctx.dataset.label+': '+ctx.raw+'d';
+            const v=ctx.raw;
+            return v<=3?'  🚨 URGENT: '+v+'d':v<=7?'  ⏰ Soon: '+v+'d':'  🟢 '+v+'d remaining';
+          }
+        }
+      }
+    },
+    scales:{
+      x:{grid:{color:GC},ticks:{color:TC,font:{size:8},maxRotation:30}},
+      y:{grid:{color:GC},ticks:{color:TC},min:0,
+         title:{display:true,text:'Days Remaining',color:LC,font:{size:9}}}
+    }
+  }
+});
+
+// Margin + ABC panel
+const pMar = document.getElementById('pMar');
+pMar.innerHTML = '<div class="pt">💰 Gross Margin % · Line Chart · Sorted Low → High</div>'
+  +'<div class="sub">Green ≥25% · Cyan ≥12% · Yellow ≥0% · Red &lt;0% — with ABC classification</div>'
+  +'<div style="position:relative;height:210px"><canvas id="cMar"></canvas></div>'
+  +'<div class="abc" id="abcG"></div>';
+
+new Chart(document.getElementById('cMar'),{
+  type:'line',
+  data:{labels:D.mrNames,datasets:[
+    {label:'Gross Margin %',data:D.mrVals,borderColor:'#a855f7',
+     backgroundColor:'rgba(168,85,247,.07)',borderWidth:2.5,tension:.35,fill:true,
+     pointBackgroundColor:D.mrCols,pointBorderColor:D.mrCols,
+     pointRadius:6,pointHoverRadius:9,animation:false},
+    {label:'25% Target',data:D.mrNames.map(()=>25),borderColor:'rgba(0,255,136,.35)',
+     borderDash:[5,5],borderWidth:1.2,pointRadius:0,fill:false},
+    {label:'12% Floor',data:D.mrNames.map(()=>12),borderColor:'rgba(255,187,0,.35)',
+     borderDash:[3,6],borderWidth:1.2,pointRadius:0,fill:false},
+    {label:'Break-even',data:D.mrNames.map(()=>0),borderColor:'rgba(255,51,102,.30)',
+     borderDash:[2,7],borderWidth:1,pointRadius:0,fill:false}
+  ]},
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:false,
+    interaction:{mode:'index',intersect:false},
+    plugins:{legend:{labels:{color:LC,boxWidth:10,font:{size:9}}},
+      tooltip:{backgroundColor:'rgba(10,14,26,.96)',borderColor:'#1e3a5f',borderWidth:1,
+        titleColor:LC,bodyColor:'#cbd5e1',padding:10,
+        callbacks:{title:ctx=>'💰 '+ctx[0].label,
+          label:ctx=>{
+            if(ctx.datasetIndex>0) return'  '+ctx.dataset.label+': '+ctx.raw+'%';
+            const i=ctx.dataIndex;
+            return['  Margin : '+ctx.raw.toFixed(1)+'%',
+                   '  Sell ৳ : '+D.mrSells[i],
+                   '  Cost ৳ : '+D.mrCosts[i]];
+          }
+        }
+      }
+    },
+    scales:{
+      x:{grid:{color:GC},ticks:{color:TC,maxRotation:32,font:{size:9}}},
+      y:{grid:{color:GC},ticks:{color:TC},
+         title:{display:true,text:'Gross Margin %',color:LC},
+         suggestedMin:-5,suggestedMax:40}
+    }
+  }
+});
+
+// ABC grid
+document.getElementById('abcG').innerHTML =
+  '<div class="ac"><div class="al" style="color:#00ff88">A</div>'
+  +'<div class="alb">High Value (Top 20%)</div>'
+  +'<div class="ai">'+D.aItems+'</div></div>'
+  +'<div class="ac"><div class="al" style="color:#00cfff">B</div>'
+  +'<div class="alb">Medium Value (20–50%)</div>'
+  +'<div class="ai">'+D.bItems+'</div></div>'
+  +'<div class="ac"><div class="al" style="color:#94a3b8">C</div>'
+  +'<div class="alb">Low Value (bottom 50%)</div>'
+  +'<div class="ai">'+D.cItems+'</div></div>';
+
+</script></body></html>"""
+
+        components.html(_iframe2, height=1700, scrolling=False)
 
     # ═════════════════════════════════════════════════════════════════════════
     # TAB 1 — INVENTORY
