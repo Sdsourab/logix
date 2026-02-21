@@ -3391,6 +3391,43 @@ class NexusUI:
             for r in health_rows
         ]) + "]"
 
+        # ── Enhanced Stock Line Chart data payloads ────────────────────────────
+        import datetime as _dt
+        _ts_now     = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        gap_js      = str([r["rop"] - r["stk"] for r in health_rows])          # + = below ROP
+        ratio_pct_js= str([round(r["stock_ratio"] * 100, 1) for r in health_rows])
+        half_rop_js = str([round(r["rop"] * 0.5) for r in health_rows])
+        ov_thresh_js= str([r["eoq"] * 2 for r in health_rows])
+        order_qty_js= str([max(0, r["eoq"] - r["stk"]) for r in health_rows])
+
+        # days_cover = stock ÷ (ROP / 7)  — proxy for weekly reorder cycle
+        days_cover_js = str([
+            round(r["stk"] / max(r["rop"] / 7.0, 0.5), 1)
+            for r in health_rows
+        ])
+
+        zone_js = str([
+            "CRITICAL"  if r["stk"] == 0 else
+            "CRITICAL"  if r["stk"] < r["rop"] * 0.5 else
+            "LOW"       if r["stk"] < r["rop"] else
+            "OVERSTOCK" if r["stk"] > r["eoq"] * 2 else
+            "HEALTHY"
+            for r in health_rows
+        ])
+
+        # Per-point colors for the stock line
+        pt_colors_js = str([
+            "#ff3366" if r["stk"] < r["rop"] * 0.5 else
+            "#ffbb00" if r["stk"] < r["rop"] else
+            "#a855f7" if r["stk"] > r["eoq"] * 2 else
+            "#00ff88"
+            for r in health_rows
+        ])
+
+        # Short category labels for badge row
+        cat_short_js = str([r["category"][:8] for r in health_rows])
+
         inv_dashboard_html = f"""<!DOCTYPE html>
 <html><head>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -3414,6 +3451,32 @@ class NexusUI:
     letter-spacing:.8px; text-transform:uppercase; margin-bottom:12px;
   }}
   canvas {{ max-width:100%; }}
+
+  /* Zone legend pills */
+  .zone-pill {{
+    display:inline-flex; align-items:center; gap:4px;
+    font-size:.62rem; font-weight:700; letter-spacing:.3px;
+    padding:2px 8px; border-radius:20px; border:1px solid;
+  }}
+
+  /* Stat tiles */
+  .stat-tile {{
+    background:#0a0e1a; border:1px solid #1e3a5f; border-radius:8px;
+    padding:8px 10px; text-align:center;
+  }}
+  .stat-tile-val {{ font-size:1.3rem; font-weight:800; line-height:1; }}
+  .stat-tile-lbl {{ font-size:.60rem; color:#94a3b8; margin-top:3px; }}
+
+  /* SKU badge strip */
+  .sku-badge {{
+    background:#0a0e1a; border-radius:8px; padding:9px;
+    position:relative; overflow:hidden;
+    border-left:3px solid transparent;
+  }}
+  .sku-badge-name  {{ font-size:.65rem; color:#7dd3fc; font-weight:700; margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+  .sku-badge-zone  {{ font-size:.60rem; font-weight:800; letter-spacing:.4px; margin-bottom:4px; }}
+  .sku-badge-row   {{ display:flex; justify-content:space-between; font-size:.58rem; color:#94a3b8; margin-top:2px; }}
+  .sku-badge-val   {{ color:#cbd5e1; font-weight:600; }}
 
   /* SKU Health Cards grid */
   .cards {{ display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-top:4px; }}
@@ -3461,28 +3524,78 @@ class NexusUI:
   <div class="cards" id="skuCards"></div>
 </div>
 
-<!-- ── Row 2: Stock vs ROP vs EOQ  +  Radar ──────────────────────────── -->
-<div class="grid row2" style="margin-bottom:16px;">
-  <div class="panel">
-    <div class="panel-title">📦 Stock Level vs Reorder Point vs EOQ</div>
-    <canvas id="stockBarChart" height="220"></canvas>
+<!-- ── Row 2: Stock Line Chart (FULL WIDTH) ───────────────────────────── -->
+<div class="panel" style="margin-bottom:16px;">
+
+  <!-- Header row -->
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+    <div>
+      <div class="panel-title" style="margin-bottom:2px;">
+        📦 STOCK LEVEL INTELLIGENCE  ·  Current vs Reorder Point vs EOQ vs Thresholds
+      </div>
+      <div style="font-size:.68rem;color:#94a3b8;">
+        Line chart — 5 reference layers  ·  Per-SKU zone colouring  ·  Real-time data
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+      <!-- Zone legend pills -->
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <span class="zone-pill" style="background:rgba(255,51,102,.18);border-color:#ff3366;color:#ff3366;">🔴 Critical  &lt; ½ ROP</span>
+        <span class="zone-pill" style="background:rgba(255,187,0,.15);border-color:#ffbb00;color:#ffbb00;">🟡 Low  &lt; ROP</span>
+        <span class="zone-pill" style="background:rgba(0,255,136,.13);border-color:#00ff88;color:#00ff88;">🟢 Healthy  ROP → 2×EOQ</span>
+        <span class="zone-pill" style="background:rgba(168,85,247,.15);border-color:#a855f7;color:#a855f7;">🟣 Overstock  &gt; 2×EOQ</span>
+      </div>
+      <div id="liveStamp" style="font-size:.65rem;color:#475569;white-space:nowrap;"></div>
+    </div>
   </div>
+
+  <!-- Summary stat tiles -->
+  <div id="statTiles" style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:14px;"></div>
+
+  <!-- Main chart -->
+  <div style="position:relative;height:340px;">
+    <canvas id="stockLineChart"></canvas>
+  </div>
+
+  <!-- Per-SKU detail badge strip -->
+  <div id="skuBadgeStrip" style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:14px;"></div>
+
+  <!-- Secondary: Stock Fill-Rate bar -->
+  <div style="margin-top:16px;border-top:1px solid #1e3a5f;padding-top:14px;">
+    <div class="panel-title" style="margin-bottom:8px;">📊 Stock Fill Rate (% of EOQ)  ·  Target Zone: 50% – 150%</div>
+    <div style="position:relative;height:110px;">
+      <canvas id="fillRateChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Gap-to-ROP analysis -->
+  <div style="margin-top:16px;border-top:1px solid #1e3a5f;padding-top:14px;">
+    <div class="panel-title" style="margin-bottom:8px;">⚡ Gap to Reorder Point  ·  Positive = Units Needed  ·  Negative = Buffer Above ROP</div>
+    <div style="position:relative;height:110px;">
+      <canvas id="gapChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- ── Row 2b: Radar (now standalone half+half) ───────────────────────── -->
+<div class="grid row2" style="margin-bottom:16px;">
   <div class="panel">
     <div class="panel-title">🕸️ Multi-Dimension Radar  ·  Top 4 SKUs</div>
     <canvas id="radarChart" height="220"></canvas>
   </div>
+  <!-- second half: reuse donut here so row is balanced -->
+  <div class="panel">
+    <div class="panel-title">🍩 Portfolio Status Distribution</div>
+    <canvas id="donutChart" height="170"></canvas>
+    <div id="donutLegend" style="margin-top:8px;"></div>
+  </div>
 </div>
 
-<!-- ── Row 3: Portfolio Donut  +  Health vs Margin Bubble  +  Urgency ── -->
-<div class="grid row3" style="margin-bottom:16px;">
+<!-- ── Row 3: Portfolio Bubble + Urgency ──────────────────────────────── -->
+<div class="grid row2" style="margin-bottom:16px;">
   <div class="panel">
     <div class="panel-title">💹 Health Score vs Gross Margin  ·  Bubble = Stock Qty</div>
     <canvas id="bubbleChart" height="210"></canvas>
-  </div>
-  <div class="panel">
-    <div class="panel-title">🍩 Portfolio Status</div>
-    <canvas id="donutChart" height="160"></canvas>
-    <div id="donutLegend" style="margin-top:8px;"></div>
   </div>
   <div class="panel">
     <div class="panel-title">⚡ Reorder Urgency</div>
@@ -3518,6 +3631,18 @@ const catVals    = {cat_vals_js};
 const barColors  = {bar_colors_js};
 const scatterRaw = {scatter_js};
 
+// ── Enhanced stock chart data ───────────────────────────────────────────────
+const ptColors    = {pt_colors_js};
+const halfRops    = {half_rop_js};
+const ovThresh    = {ov_thresh_js};
+const gapToRop    = {gap_js};
+const ratiosPct   = {ratio_pct_js};
+const daysCover   = {days_cover_js};
+const orderQtys   = {order_qty_js};
+const zones       = {zone_js};
+const catShort    = {cat_short_js};
+const LIVE_TS     = "{_ts_now}";
+
 const PANEL_BG = '#0d1224';
 const GRID_CLR = 'rgba(30,58,95,0.6)';
 const LABEL_CLR= '#7dd3fc';
@@ -3549,44 +3674,386 @@ names.forEach((n,i) => {{
     </div>`;
 }});
 
-// ── 2. Stock Level Grouped Bar ─────────────────────────────────────────────
-new Chart(document.getElementById('stockBarChart'), {{
-  type: 'bar',
+// ── 2. LIVE TIMESTAMP ──────────────────────────────────────────────────────
+document.getElementById('liveStamp').textContent = '🕐 Last updated: ' + LIVE_TS;
+
+// ── ZONE COLOUR HELPER ─────────────────────────────────────────────────────
+function zoneColor(z) {{
+  if (z==='CRITICAL')  return '#ff3366';
+  if (z==='LOW')       return '#ffbb00';
+  if (z==='OVERSTOCK') return '#a855f7';
+  return '#00ff88';
+}}
+function zoneBg(z) {{
+  if (z==='CRITICAL')  return 'rgba(255,51,102,.12)';
+  if (z==='LOW')       return 'rgba(255,187,0,.09)';
+  if (z==='OVERSTOCK') return 'rgba(168,85,247,.10)';
+  return 'rgba(0,255,136,.07)';
+}}
+
+// ── STAT TILES ─────────────────────────────────────────────────────────────
+const critCount  = zones.filter(z=>z==='CRITICAL').length;
+const lowCount   = zones.filter(z=>z==='LOW').length;
+const healthyCount=zones.filter(z=>z==='HEALTHY').length;
+const ovCount    = zones.filter(z=>z==='OVERSTOCK').length;
+const avgRatio   = (ratiosPct.reduce((a,b)=>a+b,0)/ratiosPct.length).toFixed(1);
+const totalOrder = orderQtys.reduce((a,b)=>a+b,0);
+
+const tileData = [
+  {{ val: critCount,     lbl: '🔴 Critical SKUs',    col: '#ff3366' }},
+  {{ val: lowCount,      lbl: '🟡 Below ROP',         col: '#ffbb00' }},
+  {{ val: healthyCount,  lbl: '🟢 Healthy',           col: '#00ff88' }},
+  {{ val: ovCount,       lbl: '🟣 Overstock',         col: '#a855f7' }},
+  {{ val: avgRatio+'%',  lbl: '📊 Avg Fill Rate',     col: '#00cfff' }},
+  {{ val: totalOrder,    lbl: '📦 Total Units Needed', col: '#f97316' }},
+];
+const tilesEl = document.getElementById('statTiles');
+tileData.forEach(t => {{
+  tilesEl.innerHTML += `<div class="stat-tile">
+    <div class="stat-tile-val" style="color:${{t.col}}">${{t.val}}</div>
+    <div class="stat-tile-lbl">${{t.lbl}}</div>
+  </div>`;
+}});
+
+// ── ZONE BAND PLUGIN (draws colored background per SKU column) ─────────────
+const zoneBandPlugin = {{
+  id: 'zoneBands',
+  beforeDraw(chart) {{
+    const {{ctx, chartArea:{{left,right,top,bottom}}, scales:{{x,y}}}} = chart;
+    if (!x || !y) return;
+    const n = names.length;
+    const colW = (right - left) / n;
+    ctx.save();
+    zones.forEach((z, i) => {{
+      const cx = x.getPixelForValue(i);
+      ctx.fillStyle = zoneBg(z);
+      ctx.fillRect(cx - colW/2, top, colW, bottom - top);
+    }});
+    ctx.restore();
+  }}
+}};
+
+// ── 2. MAIN STOCK LINE CHART ───────────────────────────────────────────────
+new Chart(document.getElementById('stockLineChart'), {{
+  type: 'line',
+  plugins: [zoneBandPlugin],
   data: {{
     labels: names,
     datasets: [
-      {{ label:'Current Stock', data:stocks,
-         backgroundColor: barColors.map(c=>c+'bb'),
-         borderColor: barColors, borderWidth:1.5, borderRadius:4 }},
-      {{ label:'Reorder Point', data:rops,
-         backgroundColor:'rgba(255,187,0,0.25)',
-         borderColor:'#ffbb00', borderWidth:1.5, borderRadius:4,
-         borderDash:[4,3] }},
-      {{ label:'EOQ', data:eoqs,
-         backgroundColor:'rgba(0,207,255,0.15)',
-         borderColor:'#00cfff', borderWidth:1.5, borderRadius:4 }},
+      // ── Dataset 1: Current Stock (main line, per-point colored) ──────────
+      {{
+        label: 'Current Stock',
+        data: stocks,
+        borderColor: '#00cfff',
+        borderWidth: 2.5,
+        tension: 0.38,
+        fill: false,
+        pointBackgroundColor: ptColors,
+        pointBorderColor: ptColors,
+        pointRadius: 7,
+        pointHoverRadius: 10,
+        pointBorderWidth: 2,
+        order: 1,
+        z: 10,
+      }},
+      // ── Dataset 2: Reorder Point (dashed amber) ──────────────────────────
+      {{
+        label: 'Reorder Point (ROP)',
+        data: rops,
+        borderColor: '#ffbb00',
+        borderWidth: 1.8,
+        borderDash: [6, 4],
+        tension: 0.25,
+        fill: false,
+        pointRadius: 4,
+        pointHoverRadius: 7,
+        pointBackgroundColor: '#ffbb00',
+        pointBorderColor: '#ffbb00',
+        order: 2,
+      }},
+      // ── Dataset 3: EOQ Target (dashed cyan) ─────────────────────────────
+      {{
+        label: 'EOQ Target',
+        data: eoqs,
+        borderColor: '#00ff88',
+        borderWidth: 1.8,
+        borderDash: [8, 5],
+        tension: 0.25,
+        fill: false,
+        pointRadius: 4,
+        pointHoverRadius: 7,
+        pointBackgroundColor: '#00ff88',
+        pointBorderColor: '#00ff88',
+        order: 3,
+      }},
+      // ── Dataset 4: Overstock Threshold 2×EOQ (dotted purple) ─────────────
+      {{
+        label: 'Overstock Threshold (2×EOQ)',
+        data: ovThresh,
+        borderColor: '#a855f7',
+        borderWidth: 1.4,
+        borderDash: [3, 6],
+        tension: 0.25,
+        fill: false,
+        pointRadius: 3,
+        pointHoverRadius: 6,
+        pointBackgroundColor: '#a855f7',
+        pointBorderColor: '#a855f7',
+        order: 4,
+      }},
+      // ── Dataset 5: Critical boundary ½×ROP (faint red dotted) ────────────
+      {{
+        label: 'Critical Boundary (½ ROP)',
+        data: halfRops,
+        borderColor: 'rgba(255,51,102,0.55)',
+        borderWidth: 1.2,
+        borderDash: [2, 8],
+        tension: 0.25,
+        fill: false,
+        pointRadius: 2,
+        pointHoverRadius: 5,
+        pointBackgroundColor: 'rgba(255,51,102,0.55)',
+        order: 5,
+      }},
     ]
   }},
   options: {{
-    responsive:true, maintainAspectRatio:false,
-    plugins:{{
-      legend:{{ labels:{{ color:LABEL_CLR, boxWidth:12 }} }},
-      tooltip:{{
-        callbacks:{{
-          afterLabel: ctx => {{
-            const i = ctx.dataIndex;
-            const ratio = (stocks[i]/eoqs[i]).toFixed(2);
-            return `Stock/EOQ ratio: ${{ratio}}`;
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    interaction: {{ mode:'index', intersect:false }},
+    plugins: {{
+      legend: {{
+        display: true,
+        position: 'top',
+        labels: {{
+          color: LABEL_CLR, boxWidth: 16, padding: 16,
+          usePointStyle: true, pointStyleWidth: 12,
+          font: {{ size: 11 }},
+        }}
+      }},
+      tooltip: {{
+        backgroundColor: 'rgba(10,14,26,0.96)',
+        borderColor: '#1e3a5f',
+        borderWidth: 1,
+        titleColor: '#7dd3fc',
+        bodyColor: '#cbd5e1',
+        padding: 12,
+        callbacks: {{
+          title: ctx => '📦 ' + ctx[0].label,
+          afterBody: ctx => {{
+            const i = ctx[0].dataIndex;
+            const z   = zones[i];
+            const col = zoneColor(z);
+            return [
+              '',
+              `  Zone      : ${{z}}`,
+              `  Stock     : ${{stocks[i]}} units`,
+              `  ROP       : ${{rops[i]}} units  (gap: ${{gapToRop[i]>0?'+':''}}${{gapToRop[i]}})`,
+              `  EOQ       : ${{eoqs[i]}} units`,
+              `  Fill Rate : ${{ratiosPct[i]}}% of EOQ`,
+              `  Days Cover: ~${{daysCover[i]}} days`,
+              `  Order Qty : ${{orderQtys[i]}} units to reach EOQ`,
+            ];
           }}
         }}
       }}
     }},
-    scales:{{
-      x:{{ grid:{{color:GRID_CLR}}, ticks:{{maxRotation:35,color:TEXT_CLR}} }},
-      y:{{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
-           title:{{display:true,text:'Units',color:LABEL_CLR}} }}
+    scales: {{
+      x: {{
+        grid: {{ color: GRID_CLR }},
+        ticks: {{
+          color: ctx => zoneColor(zones[ctx.index] || 'HEALTHY'),
+          maxRotation: 32,
+          font: {{ size: 10, weight: '600' }},
+        }},
+        title: {{ display:true, text:'SKU', color:LABEL_CLR, font:{{size:11}} }}
+      }},
+      y: {{
+        grid: {{ color: GRID_CLR }},
+        ticks: {{ color: TEXT_CLR }},
+        title: {{ display:true, text:'Units in Stock', color:LABEL_CLR, font:{{size:11}} }},
+        beginAtZero: true,
+      }}
     }}
   }}
+}});
+
+// ── 2b. STOCK FILL-RATE LINE CHART ─────────────────────────────────────────
+// Fill rate = stocks[i] / eoqs[i] * 100
+// Target band: 50%–150%
+const fillRateBandPlugin = {{
+  id: 'fillBand',
+  beforeDraw(chart) {{
+    const {{ctx, chartArea:{{left,right,top,bottom}}, scales:{{y}}}} = chart;
+    if (!y) return;
+    const y50  = y.getPixelForValue(50);
+    const y150 = y.getPixelForValue(150);
+    ctx.save();
+    // Target zone band (50-150%)
+    ctx.fillStyle = 'rgba(0,255,136,0.07)';
+    ctx.fillRect(left, y150, right-left, y50-y150);
+    // 100% reference line
+    const y100 = y.getPixelForValue(100);
+    ctx.strokeStyle = 'rgba(0,207,255,0.4)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5,5]);
+    ctx.beginPath(); ctx.moveTo(left,y100); ctx.lineTo(right,y100); ctx.stroke();
+    ctx.restore();
+  }}
+}};
+
+new Chart(document.getElementById('fillRateChart'), {{
+  type: 'line',
+  plugins: [fillRateBandPlugin],
+  data: {{
+    labels: names,
+    datasets: [{{
+      label: 'Fill Rate %',
+      data: ratiosPct,
+      borderColor: '#00cfff',
+      borderWidth: 2,
+      tension: 0.38,
+      fill: true,
+      backgroundColor: ctx => {{
+        const chart = ctx.chart;
+        const {{ctx:c, chartArea}} = chart;
+        if (!chartArea) return 'transparent';
+        const grad = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+        grad.addColorStop(0, 'rgba(0,207,255,0.25)');
+        grad.addColorStop(1, 'rgba(0,207,255,0.02)');
+        return grad;
+      }},
+      pointBackgroundColor: ptColors,
+      pointBorderColor: ptColors,
+      pointRadius: 5,
+      pointHoverRadius: 8,
+      animation: false,
+    }}]
+  }},
+  options: {{
+    responsive:true, maintainAspectRatio:false,
+    animation: false,
+    interaction: {{ mode:'index', intersect:false }},
+    plugins: {{
+      legend: {{ labels:{{ color:LABEL_CLR, boxWidth:12 }} }},
+      tooltip: {{
+        backgroundColor:'rgba(10,14,26,0.96)', borderColor:'#1e3a5f', borderWidth:1,
+        titleColor:'#7dd3fc', bodyColor:'#cbd5e1',
+        callbacks: {{
+          title: ctx => ctx[0].label,
+          label: ctx => `  Fill Rate: ${{ctx.raw}}%  (target: 50–150%)`,
+          afterLabel: ctx => `  EOQ: ${{eoqs[ctx.dataIndex]}}u  |  Stock: ${{stocks[ctx.dataIndex]}}u`,
+        }}
+      }}
+    }},
+    scales: {{
+      x: {{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR, font:{{size:9}}, maxRotation:30}} }},
+      y: {{
+        grid: {{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
+        title: {{display:true, text:'% of EOQ', color:LABEL_CLR}},
+        beginAtZero: true,
+      }}
+    }}
+  }}
+}});
+
+// ── 2c. GAP-TO-ROP LINE CHART ──────────────────────────────────────────────
+// positive gap → stock below ROP → need to order
+// negative gap → stock above ROP → buffer
+const gapColors = gapToRop.map(g => g > 0 ? '#ff3366' : '#00ff88');
+new Chart(document.getElementById('gapChart'), {{
+  type: 'line',
+  data: {{
+    labels: names,
+    datasets: [{{
+      label: 'Gap to ROP',
+      data: gapToRop,
+      borderColor: '#7dd3fc',
+      borderWidth: 2,
+      tension: 0.35,
+      fill: ctx => ctx.p0.parsed.y >= 0 ? 'origin' : '-1',
+      backgroundColor: ctx => {{
+        const chart = ctx.chart;
+        const {{ctx:c, chartArea}} = chart;
+        if (!chartArea) return 'transparent';
+        const grad = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+        grad.addColorStop(0, 'rgba(255,51,102,0.20)');
+        grad.addColorStop(0.5,'rgba(255,51,102,0.05)');
+        grad.addColorStop(1, 'rgba(0,255,136,0.10)');
+        return grad;
+      }},
+      pointBackgroundColor: gapColors,
+      pointBorderColor: gapColors,
+      pointRadius: 5,
+      pointHoverRadius: 8,
+      animation: false,
+    }},
+    {{
+      label: 'Zero Line',
+      data: names.map(()=>0),
+      borderColor: 'rgba(255,255,255,0.15)',
+      borderWidth: 1,
+      borderDash: [4,4],
+      pointRadius: 0,
+      fill: false,
+    }}]
+  }},
+  options: {{
+    responsive:true, maintainAspectRatio:false,
+    animation: false,
+    interaction: {{ mode:'index', intersect:false }},
+    plugins: {{
+      legend: {{ labels:{{ color:LABEL_CLR, boxWidth:12 }} }},
+      tooltip: {{
+        backgroundColor:'rgba(10,14,26,0.96)', borderColor:'#1e3a5f', borderWidth:1,
+        titleColor:'#7dd3fc', bodyColor:'#cbd5e1',
+        callbacks: {{
+          title: ctx => ctx[0].label,
+          label: ctx => {{
+            if(ctx.datasetIndex===1) return null;
+            const g = ctx.raw;
+            return g > 0
+              ? `  ⚠️ Below ROP by ${{g}} units — order needed`
+              : `  ✅ Above ROP by ${{Math.abs(g)}} units — buffer OK`;
+          }},
+          afterLabel: ctx => {{
+            if(ctx.datasetIndex===1) return null;
+            const i = ctx.dataIndex;
+            return `  Order to EOQ: ${{orderQtys[i]}} units  |  ~${{daysCover[i]}} days cover`;
+          }}
+        }}
+      }}
+    }},
+    scales: {{
+      x: {{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR, font:{{size:9}}, maxRotation:30}} }},
+      y: {{
+        grid: {{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
+        title: {{display:true, text:'Units Gap (+ = need, − = buffer)', color:LABEL_CLR}},
+      }}
+    }}
+  }}
+}});
+
+// ── 2d. PER-SKU BADGE STRIP ────────────────────────────────────────────────
+const badgeEl = document.getElementById('skuBadgeStrip');
+names.forEach((n, i) => {{
+  const z   = zones[i];
+  const col = zoneColor(z);
+  const bg  = zoneBg(z);
+  const zIcon = z==='CRITICAL'?'🔴':z==='LOW'?'🟡':z==='OVERSTOCK'?'🟣':'🟢';
+  badgeEl.innerHTML += `
+  <div class="sku-badge" style="background:${{bg}};border-left-color:${{col}};">
+    <div class="sku-badge-name">${{n}}</div>
+    <div class="sku-badge-zone" style="color:${{col}}">${{zIcon}} ${{z}}</div>
+    <div style="font-size:.60rem;color:#94a3b8;margin-bottom:3px;">${{catShort[i]}}</div>
+    <div class="sku-badge-row"><span>Stock</span><span class="sku-badge-val">${{stocks[i]}}</span></div>
+    <div class="sku-badge-row"><span>ROP</span><span class="sku-badge-val">${{rops[i]}}</span></div>
+    <div class="sku-badge-row"><span>EOQ</span><span class="sku-badge-val">${{eoqs[i]}}</span></div>
+    <div class="sku-badge-row"><span>Fill</span><span class="sku-badge-val" style="color:${{col}}">${{ratiosPct[i]}}%</span></div>
+    <div class="sku-badge-row"><span>Cover</span><span class="sku-badge-val">~${{daysCover[i]}}d</span></div>
+    <div class="sku-badge-row"><span>Order</span><span class="sku-badge-val" style="color:${{orderQtys[i]>0?'#f97316':'#00ff88'}}">${{orderQtys[i]===0?'—':orderQtys[i]+' u'}}</span></div>
+  </div>`;
 }});
 
 // ── 3. Radar Chart ─────────────────────────────────────────────────────────
