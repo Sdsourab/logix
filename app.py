@@ -3250,23 +3250,540 @@ class NexusUI:
 
         st.divider()
 
-        # ── Inventory health ─────────────────────────────────────────────────
-        st.markdown("### 📊 Inventory Health")
+        # ── Inventory Health Intelligence Dashboard ───────────────────────────
+        st.markdown("### 📊 Inventory Health Intelligence")
+
+        # ── Compute rich metrics per SKU ─────────────────────────────────────
+        health_rows = []
+        cat_counts  = {"🟢 Healthy": 0, "🟡 Watch": 0, "🔴 Critical": 0, "🟣 Overstock": 0}
         for item in inv:
-            stk = item.get("current_stock",0)
-            eoq = item.get("eoq",50)
-            pct = min(stk / max(eoq,1), 1.0)
-            col = "#00ff88" if pct > 0.6 else ("#ffbb00" if pct > 0.3 else "#ff3366")
-            cl, cr = st.columns([3,1])
-            with cl:
-                st.markdown(f"**{item.get('name','')}**")
-                st.progress(pct)
-            with cr:
-                st.markdown(
-                    f'<div style="color:{col};font-weight:700;margin-top:.5rem;">'
-                    f'{stk} / {eoq}</div>',
-                    unsafe_allow_html=True,
-                )
+            sid   = item.get("sku_id", "")
+            name  = item.get("name", sid)
+            cat   = item.get("category", "")
+            stk   = item.get("current_stock", 0)
+            rop   = item.get("reorder_point", 20)
+            eoq   = max(item.get("eoq", 50), 1)
+            exp   = item.get("expiry_days", 999)
+            cost  = item.get("unit_cost", 0)
+            sell  = prices.get(sid, {}).get("price") or item.get("selling_price") or cost * 1.15
+            sell  = sell or cost * 1.15
+
+            # ── Health score (0–100) ──────────────────────────────────────────
+            stock_ratio = stk / eoq                               # 0=empty, 1=EOQ, >2=overstock
+            stock_score = (
+                0   if stk == 0 else
+                15  if stk < rop * 0.5 else
+                35  if stk < rop else
+                85  if stock_ratio <= 1.0 else
+                100 if stock_ratio <= 2.0 else
+                60                                                # overstock penalty
+            )
+            expiry_score = (
+                0   if exp <= 1 else
+                20  if exp <= 3 else
+                50  if exp <= 7 else
+                80  if exp <= 30 else
+                100
+            )
+            margin_score = 0.0
+            if sell > 0 and cost > 0:
+                m = (sell - cost) / sell
+                margin_score = min(max(m * 200, 0), 100)          # 50% margin → 100 pts
+            else:
+                margin_score = 50.0
+
+            health_score = round(stock_score * 0.50 + expiry_score * 0.30 + margin_score * 0.20)
+
+            if stk > eoq * 2.0:
+                label = "🟣 Overstock"; cat_counts["🟣 Overstock"] += 1
+            elif health_score >= 70:
+                label = "🟢 Healthy";   cat_counts["🟢 Healthy"] += 1
+            elif health_score >= 40:
+                label = "🟡 Watch";     cat_counts["🟡 Watch"] += 1
+            else:
+                label = "🔴 Critical";  cat_counts["🔴 Critical"] += 1
+
+            cover_days = round(stk / max(sum(
+                prices.get(sid, {}).get("price", cost) or cost for _ in [1]
+            ) / max(cost, 1), 0.1), 1) if cost else stk         # simplified
+            margin_pct = round((sell - cost) / max(sell, 1) * 100, 1) if sell else 0
+
+            # Reorder urgency 0-100
+            urgency = 0 if stk > rop else round(min((rop - stk) / max(rop, 1) * 100, 100))
+
+            health_rows.append({
+                "sid": sid, "name": name, "category": cat,
+                "stk": stk, "rop": rop, "eoq": eoq, "exp": exp,
+                "cost": cost, "sell": round(sell, 1), "margin": margin_pct,
+                "health": health_score, "label": label,
+                "urgency": urgency,
+                "stock_score": stock_score, "expiry_score": expiry_score,
+                "margin_score": round(margin_score, 1),
+                "stock_ratio": round(stock_ratio, 2),
+            })
+
+        # ── KPI summary strip ─────────────────────────────────────────────────
+        avg_health  = round(sum(r["health"] for r in health_rows) / max(len(health_rows), 1))
+        critical_ct = cat_counts["🔴 Critical"]
+        watch_ct    = cat_counts["🟡 Watch"]
+        healthy_ct  = cat_counts["🟢 Healthy"]
+        overstock_ct= cat_counts["🟣 Overstock"]
+        exp_urgent  = sum(1 for r in health_rows if r["exp"] <= 3)
+        needs_order = sum(1 for r in health_rows if r["stk"] < r["rop"])
+
+        kc = st.columns(6)
+        kc[0].metric("🏥 Portfolio Health", f"{avg_health}/100",
+                     delta="Good" if avg_health >= 70 else ("Watch" if avg_health >= 40 else "Critical"))
+        kc[1].metric("🔴 Critical",  critical_ct,  delta_color="inverse")
+        kc[2].metric("🟡 Watch",     watch_ct,     delta_color="inverse")
+        kc[3].metric("🟢 Healthy",   healthy_ct)
+        kc[4].metric("⏰ Expiry ≤3d", exp_urgent,   delta_color="inverse")
+        kc[5].metric("📦 Need Order", needs_order,  delta_color="inverse")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Build JS data payloads ─────────────────────────────────────────────
+        names_js      = str([r["name"] for r in health_rows])
+        stk_js        = str([r["stk"]  for r in health_rows])
+        rop_js        = str([r["rop"]  for r in health_rows])
+        eoq_js        = str([r["eoq"]  for r in health_rows])
+        health_js     = str([r["health"] for r in health_rows])
+        margin_js     = str([r["margin"] for r in health_rows])
+        urgency_js    = str([r["urgency"] for r in health_rows])
+        exp_js        = str([min(r["exp"], 90) for r in health_rows])
+        cat_labels_js = str(list(cat_counts.keys()))
+        cat_vals_js   = str(list(cat_counts.values()))
+
+        # ── Color per SKU by health label ─────────────────────────────────────
+        bar_colors_js = str([
+            "#00ff88" if r["label"] == "🟢 Healthy" else
+            "#ffbb00" if r["label"] == "🟡 Watch" else
+            "#ff3366" if r["label"] == "🔴 Critical" else
+            "#a855f7"
+            for r in health_rows
+        ])
+
+        # ── Radar axes per SKU (first 4 for readability) ──────────────────────
+        radar_data = health_rows[:4]
+        radar_datasets_js = "[" + ",".join([
+            f"""{{
+                label: '{r["name"][:10]}',
+                data: [{r["stock_score"]},{r["expiry_score"]},{r["margin_score"]},
+                       {100 - r["urgency"]},{min(int(r["stock_ratio"]*50),100)}],
+                borderColor: '{
+                    "#00ff88" if r["label"]=="🟢 Healthy" else
+                    "#ffbb00" if r["label"]=="🟡 Watch" else
+                    "#ff3366" if r["label"]=="🔴 Critical" else "#a855f7"
+                }',
+                backgroundColor: '{
+                    "rgba(0,255,136,0.07)" if r["label"]=="🟢 Healthy" else
+                    "rgba(255,187,0,0.07)" if r["label"]=="🟡 Watch" else
+                    "rgba(255,51,102,0.07)" if r["label"]=="🔴 Critical" else "rgba(168,85,247,0.07)"
+                }',
+                borderWidth:2, pointRadius:4, pointHoverRadius:6
+            }}"""
+            for r in radar_data
+        ]) + "]"
+
+        # ── Scatter: Health Score vs Margin ───────────────────────────────────
+        scatter_js = "[" + ",".join([
+            f"{{x:{r['margin']},y:{r['health']},label:'{r['name'][:8]}',r:{max(r['stk']//8,6)}}}"
+            for r in health_rows
+        ]) + "]"
+
+        inv_dashboard_html = f"""<!DOCTYPE html>
+<html><head>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{ background:#0a0e1a; color:#e0e8ff; font-family:'Segoe UI',monospace,sans-serif; padding:16px; }}
+  .grid {{ display:grid; gap:16px; }}
+  .row2 {{ grid-template-columns:1fr 1fr; }}
+  .row3 {{ grid-template-columns:2fr 1.2fr 1fr; }}
+  .panel {{
+    background:linear-gradient(135deg,#0d1224,#111827);
+    border:1px solid #1e3a5f; border-radius:12px; padding:16px;
+    position:relative; overflow:hidden;
+  }}
+  .panel::before {{
+    content:''; position:absolute; top:0; left:0; right:0; height:2px;
+    background:linear-gradient(90deg,#00ff88,#00cfff,#a855f7);
+  }}
+  .panel-title {{
+    font-size:.78rem; font-weight:700; color:#7dd3fc;
+    letter-spacing:.8px; text-transform:uppercase; margin-bottom:12px;
+  }}
+  canvas {{ max-width:100%; }}
+
+  /* SKU Health Cards grid */
+  .cards {{ display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-top:4px; }}
+  .card {{
+    background:#0a0e1a; border:1px solid #1e3a5f; border-radius:8px;
+    padding:8px; text-align:center; position:relative; overflow:hidden;
+  }}
+  .card-bar {{
+    position:absolute; bottom:0; left:0; right:0; height:3px;
+    border-radius:0 0 8px 8px;
+  }}
+  .card-name {{ font-size:.65rem; color:#7dd3fc; margin-bottom:3px; font-weight:600; }}
+  .card-score {{ font-size:1.4rem; font-weight:800; line-height:1; }}
+  .card-label {{ font-size:.58rem; margin-top:2px; }}
+  .card-stats {{ font-size:.58rem; color:#94a3b8; margin-top:4px; line-height:1.5; }}
+
+  /* Expiry timeline */
+  .expiry-row {{ display:flex; align-items:center; gap:8px; margin:4px 0; }}
+  .expiry-name {{ width:110px; font-size:.68rem; color:#cbd5e1; flex-shrink:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .expiry-track {{ flex:1; height:14px; background:#1e2a3a; border-radius:7px; overflow:hidden; position:relative; }}
+  .expiry-fill {{ height:100%; border-radius:7px; display:flex; align-items:center; padding-left:6px; }}
+  .expiry-val {{ font-size:.58rem; font-weight:700; color:#0a0e1a; white-space:nowrap; }}
+  .expiry-days {{ font-size:.62rem; color:#94a3b8; width:42px; text-align:right; flex-shrink:0; }}
+
+  /* Urgency meter */
+  .urg-row {{ display:flex; align-items:center; gap:6px; margin:5px 0; }}
+  .urg-name {{ width:100px; font-size:.66rem; color:#cbd5e1; flex-shrink:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .urg-track {{ flex:1; height:12px; background:#1e2a3a; border-radius:6px; overflow:hidden; }}
+  .urg-fill {{ height:100%; border-radius:6px; }}
+  .urg-pct {{ font-size:.60rem; color:#94a3b8; width:30px; text-align:right; flex-shrink:0; }}
+
+  /* ABC badges */
+  .abc-grid {{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-top:8px; }}
+  .abc-cell {{ background:#111827; border-radius:8px; padding:8px; text-align:center; }}
+  .abc-letter {{ font-size:1.6rem; font-weight:900; }}
+  .abc-label {{ font-size:.6rem; color:#94a3b8; margin-top:2px; }}
+  .abc-items {{ font-size:.62rem; color:#cbd5e1; margin-top:3px; }}
+</style>
+</head>
+<body>
+
+<!-- ── Row 1: SKU Health Cards ─────────────────────────────────────────── -->
+<div class="panel" style="margin-bottom:16px;">
+  <div class="panel-title">🏥 Per-SKU Health Score  ·  Composite (Stock 50% · Expiry 30% · Margin 20%)</div>
+  <div class="cards" id="skuCards"></div>
+</div>
+
+<!-- ── Row 2: Stock vs ROP vs EOQ  +  Radar ──────────────────────────── -->
+<div class="grid row2" style="margin-bottom:16px;">
+  <div class="panel">
+    <div class="panel-title">📦 Stock Level vs Reorder Point vs EOQ</div>
+    <canvas id="stockBarChart" height="220"></canvas>
+  </div>
+  <div class="panel">
+    <div class="panel-title">🕸️ Multi-Dimension Radar  ·  Top 4 SKUs</div>
+    <canvas id="radarChart" height="220"></canvas>
+  </div>
+</div>
+
+<!-- ── Row 3: Portfolio Donut  +  Health vs Margin Bubble  +  Urgency ── -->
+<div class="grid row3" style="margin-bottom:16px;">
+  <div class="panel">
+    <div class="panel-title">💹 Health Score vs Gross Margin  ·  Bubble = Stock Qty</div>
+    <canvas id="bubbleChart" height="210"></canvas>
+  </div>
+  <div class="panel">
+    <div class="panel-title">🍩 Portfolio Status</div>
+    <canvas id="donutChart" height="160"></canvas>
+    <div id="donutLegend" style="margin-top:8px;"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">⚡ Reorder Urgency</div>
+    <div id="urgencyList"></div>
+  </div>
+</div>
+
+<!-- ── Row 4: Expiry Timeline  +  Margin Bars ──────────────────────────── -->
+<div class="grid row2">
+  <div class="panel">
+    <div class="panel-title">⏰ Expiry Countdown Timeline  ·  Days Remaining (capped 90d)</div>
+    <div id="expiryList"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">💰 Gross Margin % per SKU  ·  with ABC Classification</div>
+    <canvas id="marginChart" height="160"></canvas>
+    <div class="abc-grid" id="abcGrid"></div>
+  </div>
+</div>
+
+<script>
+// ── Data ───────────────────────────────────────────────────────────────────
+const names      = {names_js};
+const stocks     = {stk_js};
+const rops       = {rop_js};
+const eoqs       = {eoq_js};
+const healths    = {health_js};
+const margins    = {margin_js};
+const urgencies  = {urgency_js};
+const expiryDays = {exp_js};
+const catLabels  = {cat_labels_js};
+const catVals    = {cat_vals_js};
+const barColors  = {bar_colors_js};
+const scatterRaw = {scatter_js};
+
+const PANEL_BG = '#0d1224';
+const GRID_CLR = 'rgba(30,58,95,0.6)';
+const LABEL_CLR= '#7dd3fc';
+const TEXT_CLR = '#94a3b8';
+
+Chart.defaults.color = TEXT_CLR;
+Chart.defaults.font.family = "'Segoe UI', monospace";
+Chart.defaults.font.size   = 11;
+
+// ── 1. SKU Health Cards ───────────────────────────────────────────────────
+const cardsEl = document.getElementById('skuCards');
+names.forEach((n,i) => {{
+  const h   = healths[i];
+  const col = h>=70 ? '#00ff88' : h>=40 ? '#ffbb00' : '#ff3366';
+  const lbl = h>=70 ? '🟢 Healthy' : h>=40 ? '🟡 Watch' : '🔴 Critical';
+  const sr  = (stocks[i]/eoqs[i]).toFixed(2);
+  cardsEl.innerHTML += `
+    <div class="card">
+      <div class="card-name">${{n.substring(0,13)}}</div>
+      <div class="card-score" style="color:${{col}}">${{h}}</div>
+      <div class="card-label" style="color:${{col}}">${{lbl}}</div>
+      <div class="card-stats">
+        📦 ${{stocks[i]}} / ${{eoqs[i]}}<br>
+        🔁 ROP: ${{rops[i]}}<br>
+        💹 ${{margins[i]}}%<br>
+        ⏰ ${{expiryDays[i]}}d
+      </div>
+      <div class="card-bar" style="background:${{col}};opacity:0.7;width:${{h}}%"></div>
+    </div>`;
+}});
+
+// ── 2. Stock Level Grouped Bar ─────────────────────────────────────────────
+new Chart(document.getElementById('stockBarChart'), {{
+  type: 'bar',
+  data: {{
+    labels: names,
+    datasets: [
+      {{ label:'Current Stock', data:stocks,
+         backgroundColor: barColors.map(c=>c+'bb'),
+         borderColor: barColors, borderWidth:1.5, borderRadius:4 }},
+      {{ label:'Reorder Point', data:rops,
+         backgroundColor:'rgba(255,187,0,0.25)',
+         borderColor:'#ffbb00', borderWidth:1.5, borderRadius:4,
+         borderDash:[4,3] }},
+      {{ label:'EOQ', data:eoqs,
+         backgroundColor:'rgba(0,207,255,0.15)',
+         borderColor:'#00cfff', borderWidth:1.5, borderRadius:4 }},
+    ]
+  }},
+  options: {{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{{
+      legend:{{ labels:{{ color:LABEL_CLR, boxWidth:12 }} }},
+      tooltip:{{
+        callbacks:{{
+          afterLabel: ctx => {{
+            const i = ctx.dataIndex;
+            const ratio = (stocks[i]/eoqs[i]).toFixed(2);
+            return `Stock/EOQ ratio: ${{ratio}}`;
+          }}
+        }}
+      }}
+    }},
+    scales:{{
+      x:{{ grid:{{color:GRID_CLR}}, ticks:{{maxRotation:35,color:TEXT_CLR}} }},
+      y:{{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
+           title:{{display:true,text:'Units',color:LABEL_CLR}} }}
+    }}
+  }}
+}});
+
+// ── 3. Radar Chart ─────────────────────────────────────────────────────────
+const radarDatasets = {radar_datasets_js};
+new Chart(document.getElementById('radarChart'), {{
+  type:'radar',
+  data:{{
+    labels:['Stock\\nScore','Expiry\\nScore','Margin\\nScore','Order\\nReadiness','Stock\\nRatio×50'],
+    datasets: radarDatasets
+  }},
+  options:{{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{{ legend:{{ labels:{{ color:LABEL_CLR, boxWidth:12, font:{{size:10}} }} }} }},
+    scales:{{ r:{{
+      min:0, max:100,
+      grid:{{ color:GRID_CLR }},
+      angleLines:{{ color:GRID_CLR }},
+      pointLabels:{{ color:LABEL_CLR, font:{{size:10}} }},
+      ticks:{{ color:TEXT_CLR, backdropColor:'transparent', stepSize:25 }}
+    }} }}
+  }}
+}});
+
+// ── 4. Bubble: Health vs Margin ────────────────────────────────────────────
+const bubbleDatasets = scatterRaw.map((p,i) => ({{
+  label: p.label,
+  data: [{{ x:p.x, y:p.y, r:p.r }}],
+  backgroundColor: barColors[i] + '99',
+  borderColor: barColors[i],
+  borderWidth:1.5
+}}));
+new Chart(document.getElementById('bubbleChart'), {{
+  type:'bubble',
+  data:{{ datasets: bubbleDatasets }},
+  options:{{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{{
+      legend:{{ labels:{{ color:LABEL_CLR, boxWidth:10, font:{{size:9}} }} }},
+      tooltip:{{
+        callbacks:{{
+          label: ctx => `${{ctx.dataset.label}}  Margin:${{ctx.raw.x}}%  Health:${{ctx.raw.y}}/100`
+        }}
+      }}
+    }},
+    scales:{{
+      x:{{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
+           title:{{display:true,text:'Gross Margin %',color:LABEL_CLR}} }},
+      y:{{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
+           min:0, max:100,
+           title:{{display:true,text:'Health Score',color:LABEL_CLR}} }}
+    }}
+  }}
+}});
+
+// ── 5. Donut: Portfolio Status ─────────────────────────────────────────────
+const donutColors = ['#00ff88','#ffbb00','#ff3366','#a855f7'];
+new Chart(document.getElementById('donutChart'), {{
+  type:'doughnut',
+  data:{{ labels:catLabels, datasets:[{{ data:catVals,
+    backgroundColor:donutColors.map(c=>c+'cc'),
+    borderColor:donutColors, borderWidth:2,
+    hoverOffset:8
+  }}] }},
+  options:{{
+    responsive:true, maintainAspectRatio:false, cutout:'65%',
+    plugins:{{
+      legend:{{ display:false }},
+      tooltip:{{ callbacks:{{ label: ctx => ` ${{ctx.label}}: ${{ctx.parsed}} SKUs` }} }}
+    }}
+  }},
+  plugins:[{{
+    id:'centerText',
+    beforeDraw(chart) {{
+      const {{ctx,chartArea:{{width,height,top,left}}}} = chart;
+      ctx.save();
+      const cx = left+width/2, cy = top+height/2;
+      const total = catVals.reduce((a,b)=>a+b,0);
+      ctx.font = 'bold 20px Segoe UI';
+      ctx.fillStyle = '#00ff88';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(total, cx, cy-8);
+      ctx.font = '10px Segoe UI';
+      ctx.fillStyle = '#7dd3fc';
+      ctx.fillText('SKUs', cx, cy+10);
+      ctx.restore();
+    }}
+  }}]
+}});
+// Legend
+const legEl = document.getElementById('donutLegend');
+catLabels.forEach((l,i) => {{
+  legEl.innerHTML += `<div style="display:flex;align-items:center;gap:5px;margin:2px 0;font-size:.65rem;">
+    <div style="width:10px;height:10px;border-radius:50%;background:${{donutColors[i]}};flex-shrink:0"></div>
+    <span style="color:#cbd5e1">${{l}}</span>
+    <span style="color:#7dd3fc;margin-left:auto;font-weight:700">${{catVals[i]}}</span>
+  </div>`;
+}});
+
+// ── 6. Reorder Urgency Meters ──────────────────────────────────────────────
+const urgEl = document.getElementById('urgencyList');
+const urgSorted = names.map((n,i)=>{{return{{n,u:urgencies[i],s:stocks[i],r:rops[i]}}}})
+                      .sort((a,b)=>b.u-a.u);
+urgSorted.forEach(item => {{
+  const col = item.u>=70?'#ff3366':item.u>=30?'#ffbb00':'#00ff88';
+  urgEl.innerHTML += `
+  <div class="urg-row">
+    <div class="urg-name">${{item.n.substring(0,13)}}</div>
+    <div class="urg-track">
+      <div class="urg-fill" style="width:${{item.u}}%;background:${{col}};transition:width .8s ease;"></div>
+    </div>
+    <div class="urg-pct" style="color:${{col}}">${{item.u}}%</div>
+  </div>`;
+}});
+
+// ── 7. Expiry Timeline ─────────────────────────────────────────────────────
+const expEl = document.getElementById('expiryList');
+const expSorted = names.map((n,i)=>{{return{{n,e:expiryDays[i]}}}})
+                       .sort((a,b)=>a.e-b.e);
+expSorted.forEach(item => {{
+  const pct  = Math.min(item.e/90*100,100);
+  const col  = item.e<=3?'#ff3366':item.e<=7?'#ffbb00':item.e<=30?'#00cfff':'#00ff88';
+  const flag = item.e<=1?'🚨':item.e<=3?'🔴':item.e<=7?'⏰':item.e<=30?'🟡':'🟢';
+  expEl.innerHTML += `
+  <div class="expiry-row">
+    <div class="expiry-name">${{flag}} ${{item.n.substring(0,12)}}</div>
+    <div class="expiry-track">
+      <div class="expiry-fill" style="width:${{pct}}%;background:linear-gradient(90deg,${{col}}aa,${{col}});">
+        <span class="expiry-val">${{item.e}}d</span>
+      </div>
+    </div>
+    <div class="expiry-days" style="color:${{col}}">${{item.e<=3?'URGENT':item.e<=7?'Soon':'OK'}}</div>
+  </div>`;
+}});
+
+// ── 8. Margin Bar Chart ────────────────────────────────────────────────────
+const marginColors = margins.map(m =>
+  m>=25?'rgba(0,255,136,0.8)':m>=12?'rgba(0,207,255,0.8)':
+  m>=0?'rgba(255,187,0,0.8)':'rgba(255,51,102,0.8)'
+);
+new Chart(document.getElementById('marginChart'), {{
+  type:'bar',
+  data:{{
+    labels:names,
+    datasets:[{{
+      label:'Gross Margin %',
+      data:margins,
+      backgroundColor:marginColors,
+      borderColor:marginColors.map(c=>c.replace('0.8','1')),
+      borderWidth:1, borderRadius:5
+    }}]
+  }},
+  options:{{
+    responsive:true, maintainAspectRatio:false, indexAxis:'y',
+    plugins:{{
+      legend:{{display:false}},
+      tooltip:{{callbacks:{{label:ctx=>`Margin: ${{ctx.raw.toFixed(1)}}%`}}}}
+    }},
+    scales:{{
+      x:{{ grid:{{color:GRID_CLR}}, ticks:{{color:TEXT_CLR}},
+           min:0,
+           title:{{display:true,text:'Gross Margin %',color:LABEL_CLR}} }},
+      y:{{ grid:{{color:'transparent'}}, ticks:{{color:TEXT_CLR,font:{{size:10}}}} }}
+    }}
+  }}
+}});
+
+// ── 9. ABC Classification ─────────────────────────────────────────────────
+// A = top 20% by margin×stock_val, B = next 30%, C = rest
+const abcScored = names.map((n,i)=>{{return{{n,v:margins[i]*stocks[i]}}}})
+                       .sort((a,b)=>b.v-a.v);
+const total_n = abcScored.length;
+const a_cut = Math.ceil(total_n*0.20);
+const b_cut = Math.ceil(total_n*0.50);
+const aItems = abcScored.slice(0,a_cut).map(x=>x.n.split(' ')[0]).join(', ');
+const bItems = abcScored.slice(a_cut,b_cut).map(x=>x.n.split(' ')[0]).join(', ');
+const cItems = abcScored.slice(b_cut).map(x=>x.n.split(' ')[0]).join(', ');
+document.getElementById('abcGrid').innerHTML = `
+  <div class="abc-cell">
+    <div class="abc-letter" style="color:#00ff88">A</div>
+    <div class="abc-label">High Value (Top 20%)</div>
+    <div class="abc-items">${{aItems||'—'}}</div>
+  </div>
+  <div class="abc-cell">
+    <div class="abc-letter" style="color:#00cfff">B</div>
+    <div class="abc-label">Medium Value</div>
+    <div class="abc-items">${{bItems||'—'}}</div>
+  </div>
+  <div class="abc-cell">
+    <div class="abc-letter" style="color:#94a3b8">C</div>
+    <div class="abc-label">Low Value (Bottom 50%)</div>
+    <div class="abc-items">${{cItems||'—'}}</div>
+  </div>`;
+</script>
+</body></html>"""
+
+        components.html(inv_dashboard_html, height=1560, scrolling=True)
 
     # ═════════════════════════════════════════════════════════════════════════
     # TAB 1 — INVENTORY
