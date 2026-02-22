@@ -2,7 +2,7 @@
 # BLOCK 1 ── IMPORTS, CONSTANTS & GLOBAL CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-import os, json, time, math, random, sqlite3, logging, warnings
+import os, json, time, math, random, sqlite3, logging, warnings, gc
 import datetime, traceback, hashlib, re, io, csv, threading, secrets, hmac
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -48,15 +48,33 @@ except ImportError:
         def argmax(x): return x.index(max(x)) if hasattr(x, "index") else 0
         float32 = float
 
-# ── TensorFlow / Keras
-try:
-    import tensorflow as tf  # type: ignore
-    from tensorflow.keras.models import Sequential  # type: ignore
-    from tensorflow.keras.layers import LSTM, Dense, Dropout  # type: ignore
-    from tensorflow.keras.optimizers import Adam  # type: ignore
-    TF_AVAILABLE = True
-except ImportError:
-    TF_AVAILABLE = False
+# ── TensorFlow / Keras — LAZY IMPORT (saves ~500 MB RAM on startup)
+# TF is only loaded when LSTM training is actually triggered.
+TF_AVAILABLE = False  # will be set True on first successful lazy import
+
+def _try_import_tf():
+    """Lazy-import TensorFlow. Returns True on success."""
+    global TF_AVAILABLE
+    if TF_AVAILABLE:
+        return True
+    try:
+        import tensorflow as tf  # type: ignore  # noqa: F401
+        from tensorflow.keras.models import Sequential  # type: ignore  # noqa: F401
+        from tensorflow.keras.layers import LSTM, Dense, Dropout  # type: ignore  # noqa: F401
+        from tensorflow.keras.optimizers import Adam  # type: ignore  # noqa: F401
+        # Inject into module globals so existing code can reference them
+        import sys
+        _m = sys.modules[__name__]
+        setattr(_m, 'tf', tf)
+        setattr(_m, 'Sequential', Sequential)
+        setattr(_m, 'LSTM', LSTM)
+        setattr(_m, 'Dense', Dense)
+        setattr(_m, 'Dropout', Dropout)
+        setattr(_m, 'Adam', Adam)
+        TF_AVAILABLE = True
+        return True
+    except ImportError:
+        return False
 
 # ── OpenAI-compatible client (used for Grok xAI)
 try:
@@ -461,6 +479,8 @@ class LiveDataScraper:
         if source in ("live_api", "live_search"):
             LiveDataScraper._last_good = {k: dict(v) for k, v in result.items()}
 
+        # Free any intermediate objects and help GC reclaim RAM
+        gc.collect()
         return result
 
     def fetch_weather_data(self) -> Dict[str, Any]:
@@ -1182,8 +1202,19 @@ class NexusDatabase:
         statuses = ["pending","pending","processing","in_transit","delivered","delivered","delivered"]
         base_pr  = {s: REFERENCE_PRICES[s]["price"] for s in SKUS}
         for i in range(60):
-            sku      = list(SKUS.keys())[i % len(SKUS)]
-            qty      = (i % 4) + 1
+            sku    = list(SKUS.keys())[i % len(SKUS)]
+            qty    = (i % 4) + 1
+            price  = base_pr[sku] * random.uniform(0.95, 1.08)
+            zone   = zones[i % len(zones)]
+            status = statuses[i % len(statuses)]
+            self.execute_query(
+                "INSERT OR IGNORE INTO orders "
+                "(sku_id,quantity,unit_price,customer_id,zone,status) "
+                "VALUES (?,?,?,?,?,?)",
+                (sku, qty, round(price, 2), f"CUST{i+1:03d}", zone, status),
+            )
+
+
 class SoptomAlgorithm:
     """
     SOPTOM — Supply Optimisation & Predictive Trend Operations Module.
@@ -1302,7 +1333,7 @@ class SoptomAlgorithm:
 
         factor = EVENT_DEMAND_FACTORS.get(event, {}).get(sku_id, 1.0)
 
-        if TF_AVAILABLE and NP_AVAILABLE:
+        if _try_import_tf() and NP_AVAILABLE:
             try:
                 result = self._lstm_forecast(sku_id, history)
                 result["forecast"]     = [round(v * factor, 1) for v in result["forecast"]]
@@ -2018,6 +2049,10 @@ class SoptomAlgorithm:
             with cls._lstm_bg_lock:
                 cls._lstm_bg_cache[sku_id]    = result
                 cls._lstm_bg_training[sku_id] = False
+                # ── Memory guard: keep only the 8 most recently trained SKUs ──
+                if len(cls._lstm_bg_cache) > 8:
+                    oldest = next(iter(cls._lstm_bg_cache))
+                    del cls._lstm_bg_cache[oldest]
 
             self.logger.info("LSTM background training complete for %s", sku_id)
 
@@ -3375,7 +3410,7 @@ class PyDeckRenderer:
             tooltip={"text": "{name} [{status}]\n{label}"},
             map_style="mapbox://styles/mapbox/dark-v10",
         )
-        st.pydeck_chart(deck, use_container_width=True)
+        st.pydeck_chart(deck)
 
     # ── Demand Hexagon + Column Maps ───────────────────────────────────────────
 
@@ -3425,7 +3460,7 @@ class PyDeckRenderer:
             tooltip={"text": "{name}\nDemand: {demand}"},
             map_style="mapbox://styles/mapbox/dark-v10",
         )
-        st.pydeck_chart(deck, use_container_width=True)
+        st.pydeck_chart(deck)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3612,6 +3647,60 @@ summary { color:#7dd3fc!important; font-weight:600!important; }
 ::-webkit-scrollbar-track{background:#0a0e1a;}
 ::-webkit-scrollbar-thumb{background:#1e3a5f;border-radius:3px;}
 ::-webkit-scrollbar-thumb:hover{background:#00ff88;}
+
+/* ── MOBILE RESPONSIVE ──────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+    /* Sidebar collapses nicely on mobile */
+    [data-testid="stSidebar"] { width: 100% !important; }
+
+    /* Stack Streamlit columns vertically on mobile */
+    [data-testid="column"] {
+        min-width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+
+    /* Metrics: 2 per row on mobile */
+    [data-testid="metric-container"] {
+        min-width: 45% !important;
+    }
+
+    /* Reduce font sizes for headings */
+    h1 { font-size: 1.4rem !important; }
+    h2 { font-size: 1.2rem !important; }
+    h3 { font-size: 1.05rem !important; }
+
+    /* Tab labels smaller */
+    [data-testid="stTabs"] [data-baseweb="tab"] {
+        font-size: .72rem !important;
+        padding: .4rem .5rem !important;
+    }
+
+    /* Cards full width */
+    .nx-card { padding: .85rem .95rem !important; }
+
+    /* Buttons full width on mobile */
+    .stButton > button { width: 100% !important; }
+
+    /* Tables: allow horizontal scroll */
+    [data-testid="stDataFrame"] { overflow-x: auto !important; }
+
+    /* Main content area: reduce side padding */
+    .main .block-container {
+        padding-left: .75rem !important;
+        padding-right: .75rem !important;
+        padding-top: .75rem !important;
+    }
+}
+
+@media (max-width: 480px) {
+    /* Extra small phones */
+    [data-testid="metric-container"] { min-width: 100% !important; }
+    h1 { font-size: 1.2rem !important; }
+    [data-testid="stTabs"] [data-baseweb="tab"] {
+        font-size: .65rem !important;
+        padding: .35rem .4rem !important;
+    }
+}
 </style>
 """
 
@@ -3695,11 +3784,12 @@ _LOGIN_CSS = """
     color: #e0e8ff !important;
     border-radius: 8px !important;
 }
-.logix-login-card button[kind="primary"] {
+/* Fix: use Streamlit's actual button class instead of [kind] attribute */
+.logix-login-card .stButton > button {
     background: linear-gradient(90deg,#00ff88,#00cfff) !important;
     color: #0a0e1a !important; font-weight: 700 !important;
     border-radius: 8px !important; border: none !important;
-    width: 100% !important;
+    width: 100% !important; padding: .65rem !important;
 }
 .logix-login-error {
     background: rgba(255,51,102,0.12);
@@ -3711,6 +3801,15 @@ _LOGIN_CSS = """
 .logix-login-hint {
     color: #2a4a6a; font-size: .74rem; text-align: center;
     margin-top: 1.2rem; line-height: 1.6;
+}
+/* Mobile responsiveness for login */
+@media (max-width: 600px) {
+    .logix-login-card {
+        padding: 2rem 1.4rem 1.6rem;
+        border-radius: 14px;
+        max-width: 96vw;
+    }
+    .logix-login-logo { font-size: 2rem; }
 }
 </style>
 """
@@ -4082,13 +4181,15 @@ class NexusUI:
         stats     = self.db.get_order_stats()
         revenue   = stats.get("revenue") or 0
 
-        c1,c2,c3,c4,c5,c6 = st.columns(6)
-        c1.metric("📦 Total Stock",    f"{total_stk:,}")
-        c2.metric("⚠️ Low Stock",      low_cnt,   delta=None, delta_color="inverse")
-        c3.metric("🕐 Expiry Alerts",  exp_warn,  delta=None, delta_color="inverse")
-        c4.metric("💰 Revenue (৳)",    f"{revenue:,.0f}")
-        c5.metric("📋 Total Orders",   stats.get("total",0))
-        c6.metric("✅ Delivered",       stats.get("delivered",0))
+        # ── KPI row: 3+3 split so mobile renders 2 neat rows instead of overflow ──
+        r1c1, r1c2, r1c3 = st.columns(3)
+        r1c1.metric("📦 Total Stock",    f"{total_stk:,}")
+        r1c2.metric("⚠️ Low Stock",      low_cnt,   delta=None, delta_color="inverse")
+        r1c3.metric("🕐 Expiry Alerts",  exp_warn,  delta=None, delta_color="inverse")
+        r2c1, r2c2, r2c3 = st.columns(3)
+        r2c1.metric("💰 Revenue (৳)",    f"{revenue:,.0f}")
+        r2c2.metric("📋 Total Orders",   stats.get("total",0))
+        r2c3.metric("✅ Delivered",       stats.get("delivered",0))
 
         st.divider()
 
@@ -6123,25 +6224,76 @@ document.getElementById('abcG').innerHTML =
 # BLOCK 8 ── MASTER CONTROLLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+# ── Memory-efficient singleton factories using st.cache_resource ─────────────
+# cache_resource stores ONE instance per process (not per session), which
+# dramatically reduces RAM usage compared to session_state-per-user storage.
+
+@st.cache_resource(show_spinner=False)
+def _get_db_singleton() -> NexusDatabase:
+    logging.getLogger("LogixApp").info("Init NexusDatabase (cache_resource)")
+    return NexusDatabase(DB_PATH)
+
+@st.cache_resource(show_spinner=False)
+def _get_scraper_singleton() -> LiveDataScraper:
+    logging.getLogger("LogixApp").info("Init LiveDataScraper (cache_resource)")
+    return LiveDataScraper()
+
+@st.cache_resource(show_spinner=False)
+def _get_soptom_singleton() -> "SoptomAlgorithm":
+    logging.getLogger("LogixApp").info("Init SoptomAlgorithm (cache_resource)")
+    return SoptomAlgorithm(db=_get_db_singleton())
+
+@st.cache_resource(show_spinner=False)
+def _get_dss_singleton() -> DSSEngine:
+    return DSSEngine()
+
+@st.cache_resource(show_spinner=False)
+def _get_business_singleton() -> BusinessEngine:
+    return BusinessEngine(_get_db_singleton())
+
+@st.cache_resource(show_spinner=False)
+def _get_routing_singleton() -> RoutingEngine:
+    return RoutingEngine()
+
+@st.cache_resource(show_spinner=False)
+def _get_maps_singleton() -> MapRenderer:
+    return MapRenderer()
+
+@st.cache_resource(show_spinner=False)
+def _get_pydeck_singleton() -> PyDeckRenderer:
+    return PyDeckRenderer()
+
+@st.cache_resource(show_spinner=False)
+def _get_zones_singleton() -> ZoneAnalyzer:
+    return ZoneAnalyzer()
+
+@st.cache_resource(show_spinner=False)
+def _get_auth_singleton() -> AuthManager:
+    return AuthManager(db=_get_db_singleton())
+
+@st.cache_resource(show_spinner=False)
+def _get_ui_singleton() -> "NexusUI":
+    return NexusUI(
+        db       = _get_db_singleton(),
+        scraper  = _get_scraper_singleton(),
+        soptom   = _get_soptom_singleton(),
+        dss      = _get_dss_singleton(),
+        business = _get_business_singleton(),
+        routing  = _get_routing_singleton(),
+        maps     = _get_maps_singleton(),
+        pydeck   = _get_pydeck_singleton(),
+        zones    = _get_zones_singleton(),
+        auth     = _get_auth_singleton(),
+    )
+
+
 class ApplicationController:
     """
-    Application orchestrator — singleton session-state management.
-    Heavy objects built once per Streamlit session and cached.
+    Application orchestrator.
+    Heavy objects are built once per process via @st.cache_resource
+    (not per session), massively reducing RAM usage on Streamlit Cloud.
     """
-
-    _SS = {
-        "db":       "__nx_db__",
-        "scraper":  "__nx_scraper__",
-        "soptom":   "__nx_soptom__",
-        "dss":      "__nx_dss__",
-        "business": "__nx_business__",
-        "routing":  "__nx_routing__",
-        "maps":     "__nx_maps__",
-        "pydeck":   "__nx_pydeck__",
-        "zones":    "__nx_zones__",
-        "auth":     "__nx_auth__",
-        "ui":       "__nx_ui__",
-    }
 
     def __init__(self) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -6149,7 +6301,7 @@ class ApplicationController:
     def start(self) -> None:
         try:
             self._init_defaults()
-            self._get_ui().render()
+            _get_ui_singleton().render()
         except Exception as exc:
             self._error_page(exc)
 
@@ -6163,94 +6315,6 @@ class ApplicationController:
         }.items():
             if key not in st.session_state:
                 st.session_state[key] = val
-
-    def _get_db(self) -> NexusDatabase:
-        k = self._SS["db"]
-        if k not in st.session_state:
-            self.logger.info("Init NexusDatabase")
-            st.session_state[k] = NexusDatabase(DB_PATH)
-        return st.session_state[k]
-
-    def _get_scraper(self) -> LiveDataScraper:
-        k = self._SS["scraper"]
-        if k not in st.session_state:
-            self.logger.info("Init LiveDataScraper")
-            st.session_state[k] = LiveDataScraper()
-        return st.session_state[k]
-
-    def _get_soptom(self) -> SoptomAlgorithm:
-        k = self._SS["soptom"]
-        if k not in st.session_state:
-            self.logger.info("Init SoptomAlgorithm")
-            st.session_state[k] = SoptomAlgorithm(db=self._get_db())  # ← real DB passed in
-        return st.session_state[k]
-
-    def _get_dss(self) -> DSSEngine:
-        k = self._SS["dss"]
-        if k not in st.session_state:
-            self.logger.info("Init DSSEngine")
-            st.session_state[k] = DSSEngine()
-        return st.session_state[k]
-
-    def _get_business(self) -> BusinessEngine:
-        k = self._SS["business"]
-        if k not in st.session_state:
-            self.logger.info("Init BusinessEngine")
-            st.session_state[k] = BusinessEngine(self._get_db())
-        return st.session_state[k]
-
-    def _get_routing(self) -> RoutingEngine:
-        k = self._SS["routing"]
-        if k not in st.session_state:
-            self.logger.info("Init RoutingEngine")
-            st.session_state[k] = RoutingEngine()
-        return st.session_state[k]
-
-    def _get_maps(self) -> MapRenderer:
-        k = self._SS["maps"]
-        if k not in st.session_state:
-            self.logger.info("Init MapRenderer")
-            st.session_state[k] = MapRenderer()
-        return st.session_state[k]
-
-    def _get_pydeck(self) -> PyDeckRenderer:
-        k = self._SS["pydeck"]
-        if k not in st.session_state:
-            self.logger.info("Init PyDeckRenderer")
-            st.session_state[k] = PyDeckRenderer()
-        return st.session_state[k]
-
-    def _get_zones(self) -> ZoneAnalyzer:
-        k = self._SS["zones"]
-        if k not in st.session_state:
-            self.logger.info("Init ZoneAnalyzer")
-            st.session_state[k] = ZoneAnalyzer()
-        return st.session_state[k]
-
-    def _get_auth(self) -> AuthManager:
-        k = self._SS["auth"]
-        if k not in st.session_state:
-            self.logger.info("Init AuthManager")
-            st.session_state[k] = AuthManager(db=self._get_db())
-        return st.session_state[k]
-
-    def _get_ui(self) -> NexusUI:
-        k = self._SS["ui"]
-        if k not in st.session_state:
-            self.logger.info("Init NexusUI")
-            st.session_state[k] = NexusUI(
-                db       = self._get_db(),
-                scraper  = self._get_scraper(),
-                soptom   = self._get_soptom(),
-                dss      = self._get_dss(),
-                business = self._get_business(),
-                routing  = self._get_routing(),
-                maps     = self._get_maps(),
-                pydeck   = self._get_pydeck(),
-                zones    = self._get_zones(),
-                auth     = self._get_auth(),
-            )
-        return st.session_state[k]
 
     def _error_page(self, exc: Exception) -> None:
         tb = traceback.format_exc()
