@@ -3,10 +3,17 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import os, json, time, math, random, sqlite3, logging, warnings
-import datetime, traceback, hashlib, re, io, csv, threading
+import datetime, traceback, hashlib, re, io, csv, threading, secrets, hmac
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
 from collections import defaultdict
+
+# ── bcrypt (preferred password hashing — pip install bcrypt)
+try:
+    import bcrypt as _bcrypt  # type: ignore
+    BCRYPT_AVAILABLE = True
+except ImportError:
+    BCRYPT_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -127,13 +134,48 @@ logger = logging.getLogger("LogixApp")
 # GLOBAL CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION   = "7.1.0"
+APP_VERSION   = "7.2.0"
 APP_NAME      = "LOGIX"
 DEVELOPER     = "Sourab Dey Soptom"
 DB_PATH       = "logix_v7.db"
 SCRAPE_TTL    = 600            # 10-min cache
 FORECAST_DAYS = 7
 CHALDAL_BASE  = "https://chaldal.com"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RBAC — ROLE DEFINITIONS & TAB ACCESS MATRIX
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# All available tabs in display order (index matches tabs list in render())
+ALL_TABS = [
+    "🏠 Command Centre",   # 0
+    "📦 Inventory",        # 1
+    "🧠 AI Intelligence",  # 2
+    "⚖️ DSS Engine",       # 3
+    "🗺️ Live Map",         # 4
+    "🚚 Logistics",        # 5
+    "💰 Finance",          # 6
+    "🔔 Alerts",           # 7
+    "📋 AI Logs",          # 8
+    "⚙️ Settings",         # 9
+]
+
+# Role → list of tab indices accessible
+ROLE_TAB_ACCESS: Dict[str, List[int]] = {
+    "admin":      [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],   # All tabs
+    "manager":    [0, 1, 2, 3, 7],                    # Cmd + Inv + AI + DSS + Alerts
+    "dispatcher": [4, 5],                              # Live Map + Logistics only
+}
+
+# Role display labels & badge colours
+ROLE_META: Dict[str, Dict[str, str]] = {
+    "admin":      {"label": "Super Admin",  "color": "#ff3366"},
+    "manager":    {"label": "Manager",      "color": "#ffbb00"},
+    "dispatcher": {"label": "Dispatcher",   "color": "#00cfff"},
+}
+
+# Session state key for auth context
+_AUTH_KEY = "__logix_auth__"
 
 # ── Grok xAI API
 # ── Grok xAI API key — secure fallback chain
@@ -747,6 +789,25 @@ class NexusDatabase:
         acknowledged INTEGER DEFAULT 0,
         created_at   TEXT    DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS users (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        username        TEXT    UNIQUE NOT NULL,
+        email           TEXT    UNIQUE NOT NULL,
+        name            TEXT    NOT NULL,
+        hashed_password TEXT    NOT NULL,
+        role            TEXT    NOT NULL DEFAULT 'dispatcher',
+        is_active       INTEGER NOT NULL DEFAULT 1,
+        created_at      TEXT    DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        username    TEXT    NOT NULL,
+        role        TEXT    NOT NULL,
+        action_type TEXT    NOT NULL,
+        description TEXT,
+        ip_hint     TEXT    DEFAULT 'streamlit-session',
+        timestamp   TEXT    DEFAULT (datetime('now'))
+    );
     """
 
     def __init__(self, db_path: str = DB_PATH) -> None:
@@ -761,6 +822,7 @@ class NexusDatabase:
         self._bootstrap_schema()
         self._seed_inventory()
         self._seed_orders()
+        self._seed_default_users()                             # ← RBAC: seed users on first run
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
@@ -874,6 +936,125 @@ class NexusDatabase:
 
     def acknowledge_all_alerts(self) -> None:
         self.execute_query("UPDATE alerts SET acknowledged=1 WHERE acknowledged=0")
+
+    # ── RBAC — User management ─────────────────────────────────────────────────
+
+    @staticmethod
+    def hash_password(plain: str) -> str:
+        """
+        Hash a plaintext password.
+        Uses bcrypt (pip install bcrypt) when available; falls back to
+        PBKDF2-HMAC-SHA256 (stdlib) so the app always works without bcrypt.
+        """
+        if BCRYPT_AVAILABLE:
+            return _bcrypt.hashpw(plain.encode("utf-8"), _bcrypt.gensalt(rounds=12)).decode("utf-8")
+        # PBKDF2-HMAC-SHA256 fallback: salt$iterations$hash (all hex)
+        salt = secrets.token_hex(16)
+        iterations = 260_000
+        dk = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt.encode(), iterations)
+        return f"pbkdf2${salt}${iterations}${dk.hex()}"
+
+    @staticmethod
+    def verify_password(plain: str, hashed: str) -> bool:
+        """Verify a plaintext password against a stored hash (bcrypt or PBKDF2)."""
+        try:
+            if hashed.startswith("$2"):          # bcrypt hash
+                if not BCRYPT_AVAILABLE:
+                    return False
+                return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+            if hashed.startswith("pbkdf2$"):     # PBKDF2 fallback
+                _, salt, iterations_s, stored_hex = hashed.split("$")
+                iterations = int(iterations_s)
+                dk = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"),
+                                          salt.encode(), iterations)
+                return hmac.compare_digest(dk.hex(), stored_hex)
+        except Exception:
+            pass
+        return False
+
+    def get_user(self, username: str) -> Optional[Dict]:
+        """Fetch a single active user row by username."""
+        return self.fetch_one(
+            "SELECT * FROM users WHERE username=? AND is_active=1", (username,)
+        )
+
+    def create_user(self, username: str, email: str, name: str,
+                    plain_password: str, role: str) -> bool:
+        """
+        Create a new user with a hashed password.
+        Returns True on success, False if username/email already exists.
+        """
+        hashed = self.hash_password(plain_password)
+        cur = self.execute_query(
+            "INSERT OR IGNORE INTO users (username,email,name,hashed_password,role) "
+            "VALUES (?,?,?,?,?)",
+            (username, email, name, hashed, role),
+        )
+        return bool(cur and cur.rowcount)
+
+    def change_password(self, username: str, new_plain: str) -> bool:
+        """Update a user's password hash."""
+        hashed = self.hash_password(new_plain)
+        cur = self.execute_query(
+            "UPDATE users SET hashed_password=? WHERE username=?",
+            (hashed, username),
+        )
+        return bool(cur and cur.rowcount)
+
+    def list_users(self) -> List[Dict]:
+        """Return all users (hashed_password omitted for security)."""
+        return self.fetch_all(
+            "SELECT id,username,email,name,role,is_active,created_at FROM users ORDER BY id"
+        )
+
+    def deactivate_user(self, username: str) -> None:
+        self.execute_query("UPDATE users SET is_active=0 WHERE username=?", (username,))
+
+    # ── RBAC — Audit logging ───────────────────────────────────────────────────
+
+    def log_audit(self, username: str, role: str,
+                  action_type: str, description: str) -> None:
+        """
+        Write a row to the audit_logs table.
+        Prefer calling the NexusUI helper `log_action()` which auto-fills
+        username/role from st.session_state.
+        """
+        self.execute_query(
+            "INSERT INTO audit_logs (username,role,action_type,description) "
+            "VALUES (?,?,?,?)",
+            (username, role, action_type, description),
+        )
+
+    def get_audit_logs(self, limit: int = 50) -> List[Dict]:
+        return self.fetch_all(
+            "SELECT username,role,action_type,description,timestamp "
+            "FROM audit_logs ORDER BY timestamp DESC LIMIT ?", (limit,)
+        )
+
+    # ── Private: seed default users ───────────────────────────────────────────
+
+    def _seed_default_users(self) -> None:
+        """
+        Create three built-in accounts on first run.
+        Passwords are hashed at seed time — never stored in plaintext.
+
+        Default credentials (CHANGE IN PRODUCTION):
+          admin      / Admin@1234   → role: admin
+          manager    / Manager@456  → role: manager
+          dispatcher / Rider@789    → role: dispatcher
+        """
+        n = (self.fetch_one("SELECT COUNT(*) as n FROM users") or {}).get("n", 0)
+        if n > 0:
+            return   # already seeded — skip silently
+
+        defaults = [
+            ("admin",      "admin@logix.bd",      "Sourab Dey Soptom", "Admin@1234",   "admin"),
+            ("manager",    "manager@logix.bd",     "Karim Manager",     "Manager@456",  "manager"),
+            ("dispatcher", "dispatcher@logix.bd",  "Rahim Rider",       "Rider@789",    "dispatcher"),
+        ]
+        for username, email, name, plain_pw, role in defaults:
+            self.create_user(username, email, name, plain_pw, role)
+        self.logger.info("RBAC: seeded 3 default users (admin / manager / dispatcher)")
 
     # ── Domain reads ──────────────────────────────────────────────────────────
 
@@ -3476,9 +3657,246 @@ def _source_badge(source: str) -> str:
     return f'<span class="source-ref">● REF</span>'
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# BLOCK AUTH ── AUTHENTICATION & RBAC MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-class NexusUI:
+# Minimal login-page CSS injected once
+_LOGIN_CSS = """
+<style>
+[data-testid="stAppViewContainer"] {
+    background: #0a0e1a !important;
+}
+[data-testid="stSidebar"] { display: none !important; }
+
+.logix-login-wrap {
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; min-height: 88vh;
+}
+.logix-login-card {
+    background: linear-gradient(145deg, #0d1224 0%, #111827 100%);
+    border: 1px solid #1e3a5f;
+    border-radius: 18px;
+    padding: 2.8rem 3rem 2.2rem;
+    width: 100%; max-width: 420px;
+    box-shadow: 0 8px 40px rgba(0,255,136,0.08);
+}
+.logix-login-logo {
+    font-size: 2.6rem; font-weight: 900; letter-spacing: 4px;
+    color: #00ff88; text-align: center; margin-bottom: 0.2rem;
+}
+.logix-login-sub {
+    color: #4a6fa5; font-size: .82rem; text-align: center;
+    margin-bottom: 2rem; letter-spacing: .5px;
+}
+.logix-login-card input {
+    background: #0d1224 !important;
+    border: 1px solid #1e3a5f !important;
+    color: #e0e8ff !important;
+    border-radius: 8px !important;
+}
+.logix-login-card button[kind="primary"] {
+    background: linear-gradient(90deg,#00ff88,#00cfff) !important;
+    color: #0a0e1a !important; font-weight: 700 !important;
+    border-radius: 8px !important; border: none !important;
+    width: 100% !important;
+}
+.logix-login-error {
+    background: rgba(255,51,102,0.12);
+    border: 1px solid #ff3366;
+    border-radius: 8px; padding: .75rem 1rem;
+    color: #ff6b8a; font-size: .85rem; margin-top: .8rem;
+    text-align: center;
+}
+.logix-login-hint {
+    color: #2a4a6a; font-size: .74rem; text-align: center;
+    margin-top: 1.2rem; line-height: 1.6;
+}
+</style>
+"""
+
+
+class AuthManager:
+    """
+    Authentication & Role-Based Access Control manager for LOGIX.
+
+    Responsibilities:
+    ─────────────────
+    • Render a dark-themed login screen matching LOGIX's design language.
+    • Validate credentials against the `users` SQLite table.
+    • Persist auth context in st.session_state[_AUTH_KEY].
+    • Provide role-checking helpers (is_admin, has_tab_access, etc.).
+    • Supply the log_action() audit helper used throughout NexusUI.
+    • Handle logout and session teardown.
+    """
+
+    def __init__(self, db: "NexusDatabase") -> None:
+        self.db     = db
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    # ── Public helpers ─────────────────────────────────────────────────────────
+
+    def is_authenticated(self) -> bool:
+        """Return True if a valid auth context exists in session_state."""
+        ctx = st.session_state.get(_AUTH_KEY, {})
+        return bool(ctx.get("logged_in") and ctx.get("username"))
+
+    def current_user(self) -> Dict[str, str]:
+        """
+        Return the current user context dict.
+        Keys: username, name, role, logged_in.
+        Returns an empty-ish dict when not authenticated.
+        """
+        return st.session_state.get(_AUTH_KEY, {
+            "username": "guest", "name": "Guest", "role": "dispatcher", "logged_in": False
+        })
+
+    def current_role(self) -> str:
+        return self.current_user().get("role", "dispatcher")
+
+    def is_admin(self) -> bool:
+        return self.current_role() == "admin"
+
+    def has_tab(self, tab_index: int) -> bool:
+        """Return True if the current role can view a given tab index."""
+        allowed = ROLE_TAB_ACCESS.get(self.current_role(), [])
+        return tab_index in allowed
+
+    def allowed_tabs(self) -> List[str]:
+        """Return the subset of ALL_TABS the current user may see."""
+        allowed_indices = ROLE_TAB_ACCESS.get(self.current_role(), [])
+        return [ALL_TABS[i] for i in sorted(allowed_indices)]
+
+    def log_action(self, action_type: str, description: str) -> None:
+        """
+        Write an audit log entry for the currently authenticated user.
+        Safe to call even if no user is logged in (records 'anonymous').
+        """
+        ctx = self.current_user()
+        self.db.log_audit(
+            username    = ctx.get("username", "anonymous"),
+            role        = ctx.get("role",     "unknown"),
+            action_type = action_type,
+            description = description,
+        )
+
+    # ── Login screen ───────────────────────────────────────────────────────────
+
+    def render_login(self) -> bool:
+        """
+        Render the full-screen login UI.
+        Returns True immediately if the user is already authenticated.
+        Writes auth context to st.session_state[_AUTH_KEY] on success.
+        """
+        if self.is_authenticated():
+            return True
+
+        # Inject login-page CSS (hides sidebar, applies dark card theme)
+        st.markdown(_LOGIN_CSS, unsafe_allow_html=True)
+
+        # Centre the card using columns
+        _, col, _ = st.columns([1, 1.6, 1])
+        with col:
+            st.markdown(
+                '<div class="logix-login-logo">LOGIX</div>'
+                '<div class="logix-login-sub">Supply Chain Intelligence Platform</div>',
+                unsafe_allow_html=True,
+            )
+
+            username = st.text_input(
+                "Username", placeholder="Enter your username", key="login_user"
+            )
+            password = st.text_input(
+                "Password", type="password", placeholder="Enter your password",
+                key="login_pass"
+            )
+
+            login_clicked = st.button(
+                "🔐 Sign In", type="primary", use_container_width=True, key="login_btn"
+            )
+
+            # ── Credential validation ─────────────────────────────────────────
+            if login_clicked:
+                if not username.strip() or not password.strip():
+                    st.markdown(
+                        '<div class="logix-login-error">⚠️ Please enter both username and password.</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    user_row = self.db.get_user(username.strip().lower())
+                    if user_row and NexusDatabase.verify_password(password, user_row["hashed_password"]):
+                        # ── SUCCESS ──────────────────────────────────────────
+                        st.session_state[_AUTH_KEY] = {
+                            "logged_in": True,
+                            "username":  user_row["username"],
+                            "name":      user_row["name"],
+                            "role":      user_row["role"],
+                            "login_ts":  time.time(),
+                        }
+                        # Write audit entry
+                        self.db.log_audit(
+                            user_row["username"], user_row["role"],
+                            "AUTH_LOGIN",
+                            f"User '{user_row['name']}' logged in successfully.",
+                        )
+                        self.logger.info("Login: %s (%s)", user_row["username"], user_row["role"])
+                        st.rerun()
+                    else:
+                        # ── FAILURE ───────────────────────────────────────────
+                        self.logger.warning("Failed login attempt: username='%s'", username)
+                        # Log failed attempt (no user row needed)
+                        self.db.log_audit(
+                            username.strip().lower(), "unknown",
+                            "AUTH_FAILED",
+                            f"Failed login attempt for username '{username.strip().lower()}'.",
+                        )
+                        st.markdown(
+                            '<div class="logix-login-error">❌ Invalid username or password. Please try again.</div>',
+                            unsafe_allow_html=True,
+                        )
+
+            st.markdown(
+                '<div class="logix-login-hint">'
+                "Demo accounts — change in production:<br>"
+                "<b>admin</b> / Admin@1234 &nbsp;|&nbsp; "
+                "<b>manager</b> / Manager@456 &nbsp;|&nbsp; "
+                "<b>dispatcher</b> / Rider@789"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        return self.is_authenticated()
+
+    def render_logout(self) -> None:
+        """
+        Render the profile badge + logout button inside the sidebar.
+        Call this at the TOP of NexusUI._sidebar().
+        """
+        ctx  = self.current_user()
+        role = ctx.get("role", "dispatcher")
+        meta = ROLE_META.get(role, {"label": role.title(), "color": "#7dd3fc"})
+
+        st.sidebar.markdown(
+            f"<div style='background:rgba(0,255,136,0.06);border:1px solid #1e3a5f;"
+            f"border-radius:10px;padding:.7rem 1rem;margin-bottom:.8rem;'>"
+            f"<span style='font-size:1.1rem;'>👤</span> "
+            f"<b style='color:#e0e8ff;'>{ctx.get('name','?')}</b><br>"
+            f"<span style='font-size:.75rem;color:{meta['color']};font-weight:700;"
+            f"letter-spacing:.5px;'>⬡ {meta['label'].upper()}</span>"
+            f"&nbsp;<span style='font-size:.72rem;color:#4a6fa5;'>@{ctx.get('username','?')}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        if st.sidebar.button("🚪 Logout", use_container_width=True, key="logout_btn"):
+            # Audit the logout event before clearing state
+            self.log_action("AUTH_LOGOUT", f"User '{ctx.get('name')}' logged out.")
+            # Wipe auth context but keep other state intact
+            st.session_state.pop(_AUTH_KEY, None)
+            st.rerun()
+
+
+
     """
     Full Streamlit 10-tab UI for LOGIX v7.0.
     Developer: Sourab Dey Soptom.
@@ -3492,7 +3910,8 @@ class NexusUI:
                  business: BusinessEngine, routing: RoutingEngine,
                  maps: MapRenderer,
                  pydeck: Optional[Any] = None,
-                 zones:  Optional[Any] = None) -> None:
+                 zones:  Optional[Any] = None,
+                 auth:   Optional[Any] = None) -> None:
         self.db       = db
         self.scraper  = scraper
         self.soptom   = soptom
@@ -3502,20 +3921,52 @@ class NexusUI:
         self.maps     = maps
         self.pydeck   = pydeck   # PyDeckRenderer — may be None
         self.zones    = zones    # ZoneAnalyzer   — may be None
+        self.auth     = auth     # AuthManager    — may be None
         self.logger   = logging.getLogger(self.__class__.__name__)
+
+    # ── Audit shortcut ────────────────────────────────────────────────────────
+
+    def log_action(self, action_type: str, description: str) -> None:
+        """
+        Convenience wrapper — writes an audit_log row for the active session user.
+        Falls back silently if AuthManager is not wired up.
+        """
+        if self.auth:
+            self.auth.log_action(action_type, description)
+        else:
+            self.db.log_audit("system", "system", action_type, description)
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
     def render(self) -> None:
         _inject_css()
+
+        # ── STEP 1: Authentication gate ────────────────────────────────────────
+        # If AuthManager is present, enforce login before any app content.
+        if self.auth and not self.auth.render_login():
+            # render_login() already drew the login form — stop here.
+            return
+
+        # ── STEP 2: Sidebar (includes profile badge + logout button) ──────────
         self._sidebar()
 
-        tabs = st.tabs([
-            "🏠 Command Centre", "📦 Inventory", "🧠 AI Intelligence",
-            "⚖️ DSS Engine", "🗺️ Live Map", "🚚 Logistics",
-            "💰 Finance", "🔔 Alerts", "📋 AI Logs", "⚙️ Settings",
-        ])
+        # ── STEP 3: Role-based dynamic tab construction ───────────────────────
+        #
+        # ALL_TABS is the canonical ordered list of all 10 tab labels.
+        # ROLE_TAB_ACCESS maps each role → list of allowed tab indices.
+        # We build `visible_tabs` (labels) and `index_map` (label → original index)
+        # so each tab method (_t0_, _t1_, …) is dispatched by its original index
+        # regardless of how many tabs are visible to the current role.
+        #
+        current_role = self.auth.current_role() if self.auth else "admin"
+        allowed_indices = ROLE_TAB_ACCESS.get(current_role, list(range(len(ALL_TABS))))
 
+        visible_labels = [ALL_TABS[i] for i in sorted(allowed_indices)]
+        index_map: Dict[str, int] = {ALL_TABS[i]: i for i in sorted(allowed_indices)}
+
+        tabs = st.tabs(visible_labels)
+
+        # ── STEP 4: Preload shared data ────────────────────────────────────────
         prices  = self.scraper.fetch_chaldal_prices()
         weather = self.scraper.fetch_weather_data()
         inv     = self.db.get_inventory()
@@ -3523,16 +3974,27 @@ class NexusUI:
         event   = st.session_state.get("market_event", "Normal Day")
         fcs     = st.session_state.get("forecasts", {})
 
-        with tabs[0]: self._t0_command(prices, weather, inv, event, fcs)
-        with tabs[1]: self._t1_inventory(inv, prices, event)
-        with tabs[2]: self._t2_ai(inv, prices, weather, event, fcs)
-        with tabs[3]: self._t3_dss(inv, prices, fcs)
-        with tabs[4]: self._t4_map(inv, prices, fcs)
-        with tabs[5]: self._t5_logistics(inv, prices)
-        with tabs[6]: self._t6_finance(inv, prices)
-        with tabs[7]: self._t7_alerts()
-        with tabs[8]: self._t8_ai_logs()
-        with tabs[9]: self._t9_settings(inv, prices, fcs)
+        # ── STEP 5: Tab dispatch ───────────────────────────────────────────────
+        # Map each visible tab position to the correct _tN_ method.
+        _TAB_METHODS = {
+            0: lambda: self._t0_command(prices, weather, inv, event, fcs),
+            1: lambda: self._t1_inventory(inv, prices, event),
+            2: lambda: self._t2_ai(inv, prices, weather, event, fcs),
+            3: lambda: self._t3_dss(inv, prices, fcs),
+            4: lambda: self._t4_map(inv, prices, fcs),
+            5: lambda: self._t5_logistics(inv, prices),
+            6: lambda: self._t6_finance(inv, prices),
+            7: lambda: self._t7_alerts(),
+            8: lambda: self._t8_ai_logs(),
+            9: lambda: self._t9_settings(inv, prices, fcs),
+        }
+
+        for tab_widget, label in zip(tabs, visible_labels):
+            original_idx = index_map[label]
+            with tab_widget:
+                method = _TAB_METHODS.get(original_idx)
+                if method:
+                    method()
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
 
@@ -3543,6 +4005,11 @@ class NexusUI:
                 "<p style='color:#7dd3fc;font-size:.78rem;margin-top:0;'>developed by Sourab Dey Soptom </p>",
                 unsafe_allow_html=True,
             )
+
+            # ── Profile badge + Logout (RBAC) ─────────────────────────────────
+            if self.auth:
+                self.auth.render_logout()
+
             # Data source badge
             src_label = self.scraper.get_data_source_label()
             st.markdown(f"**Data:** {src_label}")
@@ -4576,6 +5043,11 @@ document.getElementById('abcG').innerHTML =
                     "UPDATE inventory SET current_stock=?,expiry_days=?,updated_at=datetime('now') WHERE sku_id=?",
                     (edit_qty, edit_exp, edit_sku),
                 )
+                self.log_action(
+                    "STOCK_UPDATE",
+                    f"Stock updated: {sku_map.get(edit_sku, edit_sku)} → "
+                    f"qty={edit_qty}, expiry={edit_exp}d",
+                )
                 st.success(f"Updated {sku_map.get(edit_sku,edit_sku)}: {edit_qty} units, {edit_exp}d expiry")
                 st.rerun()
 
@@ -4910,10 +5382,22 @@ document.getElementById('abcG').innerHTML =
                     close_h = st.selectbox(
                         "Hub to close", ["— none —"] + list(DHAKA_HUBS.keys()), key="cl_hub"
                     )
-                    if st.button("Close", key="cl_btn") and close_h != "— none —":
+
+                    # ── Action-Level Security: admin-only destructive action ────
+                    is_admin_user = self.auth.is_admin() if self.auth else True
+                    if st.button(
+                        "Close", key="cl_btn",
+                        disabled   = not is_admin_user,
+                        help       = None if is_admin_user
+                                     else "🔒 Admin access required to close hubs.",
+                    ) and close_h != "— none —" and is_admin_user:
                         self.routing.close_hub(close_h)
                         self.db.add_alert(
                             "critical", "Logistics", f"Hub {close_h} CLOSED by operator."
+                        )
+                        self.log_action(
+                            "HUB_CLOSE",
+                            f"Hub '{close_h}' closed by {self.auth.current_user().get('username','?') if self.auth else 'operator'}.",
                         )
                         st.rerun()
 
@@ -5176,6 +5660,11 @@ document.getElementById('abcG').innerHTML =
                         "UPDATE inventory SET current_stock=MAX(0,current_stock-?) WHERE sku_id=?",
                         (n_qty, n_sku),
                     )
+                    self.log_action(
+                        "ORDER_PLACE",
+                        f"Order #{oid}: {n_qty}× {sku_map.get(n_sku,'?')} → zone={n_zone} "
+                        f"price=৳{adj_p} total=৳{total:.2f} customer={n_cid}",
+                    )
                     st.success(f"Order #{oid}: {n_qty}× {sku_map.get(n_sku,'?')} → {n_zone}  ৳{total:.2f}")
                     st.rerun()
 
@@ -5331,7 +5820,10 @@ document.getElementById('abcG').innerHTML =
 
     def _t9_settings(self, inv: List[Dict], prices: Dict, fcs: Dict) -> None:
         st.markdown("## ⚙️ System Settings & Configuration")
-        tw, tdb, tinfo = st.tabs(["⚖️ DSS Weights","🗄️ Database","ℹ️ System Info"])
+        tw, tdb, tinfo, taudit, tusers = st.tabs([
+            "⚖️ DSS Weights", "🗄️ Database", "ℹ️ System Info",
+            "📋 Audit Logs", "👥 User Management",
+        ])
 
         with tw:
             st.markdown("### MCDA Weight Calibration (must sum to 1.0)")
@@ -5497,6 +5989,129 @@ document.getElementById('abcG').innerHTML =
             else:
                 st.info("ZoneAnalyzer not initialised.")
 
+        # ── Audit Logs Tab ────────────────────────────────────────────────────
+        with taudit:
+            st.markdown("### 📋 Audit Trail")
+
+            is_admin_view = self.auth.is_admin() if self.auth else True
+            if not is_admin_view:
+                st.warning("🔒 Audit logs are visible to **admin** users only.")
+            else:
+                limit_opt = st.slider("Rows to show", 10, 200, 50, key="audit_limit")
+                logs = self.db.get_audit_logs(limit=limit_opt)
+                if logs and PANDAS_AVAILABLE:
+                    df = pd.DataFrame(logs)
+                    # Colour-code action types
+                    def _row_colour(t: str) -> str:
+                        if "FAIL" in t:   return "🔴"
+                        if "LOGIN" in t:  return "🟢"
+                        if "LOGOUT" in t: return "🟡"
+                        if "CLOSE" in t:  return "🔴"
+                        return "⚪"
+                    df["icon"] = df["action_type"].apply(_row_colour)
+                    df = df[["icon","timestamp","username","role","action_type","description"]]
+                    df.columns = ["","Time","User","Role","Action","Description"]
+                    st.dataframe(df, use_container_width=True, height=420)
+                elif logs:
+                    for row in logs:
+                        st.write(row)
+                else:
+                    st.info("No audit log entries yet. Actions like Login, Place Order, and Update Stock are recorded here.")
+
+                if st.button("🗑️ Clear Audit Logs (Admin Only)", key="clr_audit"):
+                    self.db.execute_query("DELETE FROM audit_logs")
+                    self.log_action("AUDIT_CLEAR", "Admin cleared the entire audit log.")
+                    st.success("Audit log cleared.")
+                    st.rerun()
+
+        # ── User Management Tab ───────────────────────────────────────────────
+        with tusers:
+            st.markdown("### 👥 User Management")
+
+            is_admin_mgmt = self.auth.is_admin() if self.auth else True
+            if not is_admin_mgmt:
+                st.warning("🔒 User management is restricted to **admin** users only.")
+            else:
+                # ── Current users table ───────────────────────────────────────
+                st.markdown("#### Active Users")
+                users = self.db.list_users()
+                if users and PANDAS_AVAILABLE:
+                    st.dataframe(pd.DataFrame(users), use_container_width=True, height=200)
+                else:
+                    for u in users: st.write(u)
+
+                st.divider()
+
+                # ── Create new user ───────────────────────────────────────────
+                st.markdown("#### ➕ Create New User")
+                nc1, nc2 = st.columns(2)
+                with nc1:
+                    nu_uname = st.text_input("Username",   key="nu_uname", placeholder="e.g. jdoe")
+                    nu_name  = st.text_input("Full Name",  key="nu_name",  placeholder="e.g. John Doe")
+                    nu_email = st.text_input("Email",      key="nu_email", placeholder="jdoe@logix.bd")
+                with nc2:
+                    nu_role  = st.selectbox("Role", list(ROLE_TAB_ACCESS.keys()), key="nu_role")
+                    nu_pass  = st.text_input("Password",   key="nu_pass",  type="password")
+                    nu_pass2 = st.text_input("Confirm Pwd",key="nu_pass2", type="password")
+
+                if st.button("✅ Create User", key="nu_btn"):
+                    if not all([nu_uname, nu_name, nu_email, nu_pass]):
+                        st.error("All fields are required.")
+                    elif nu_pass != nu_pass2:
+                        st.error("Passwords do not match.")
+                    elif len(nu_pass) < 8:
+                        st.error("Password must be at least 8 characters.")
+                    else:
+                        ok = self.db.create_user(nu_uname.lower(), nu_email, nu_name, nu_pass, nu_role)
+                        if ok:
+                            self.log_action("USER_CREATE",
+                                f"New user '{nu_uname}' (role={nu_role}) created.")
+                            st.success(f"User **{nu_uname}** created successfully.")
+                            st.rerun()
+                        else:
+                            st.error(f"Username or email already exists.")
+
+                st.divider()
+
+                # ── Change password ───────────────────────────────────────────
+                st.markdown("#### 🔑 Change Password")
+                cp1, cp2 = st.columns(2)
+                with cp1:
+                    cp_user = st.selectbox(
+                        "User", [u["username"] for u in users], key="cp_user"
+                    )
+                with cp2:
+                    cp_new  = st.text_input("New Password", key="cp_new", type="password")
+
+                if st.button("💾 Update Password", key="cp_btn"):
+                    if len(cp_new) < 8:
+                        st.error("Password must be at least 8 characters.")
+                    else:
+                        ok = self.db.change_password(cp_user, cp_new)
+                        if ok:
+                            self.log_action("USER_PWD_CHANGE",
+                                f"Password changed for user '{cp_user}'.")
+                            st.success(f"Password updated for **{cp_user}**.")
+                        else:
+                            st.error("Update failed.")
+
+                st.divider()
+
+                # ── Deactivate user ───────────────────────────────────────────
+                st.markdown("#### 🚫 Deactivate User")
+                active_users = [u["username"] for u in users if u.get("is_active") == 1]
+                deact_user = st.selectbox("User to deactivate", active_users, key="deact_user")
+                if st.button("🚫 Deactivate", key="deact_btn"):
+                    current_uname = self.auth.current_user().get("username") if self.auth else ""
+                    if deact_user == current_uname:
+                        st.error("You cannot deactivate your own account.")
+                    else:
+                        self.db.deactivate_user(deact_user)
+                        self.log_action("USER_DEACTIVATE",
+                            f"User '{deact_user}' deactivated.")
+                        st.success(f"User **{deact_user}** deactivated.")
+                        st.rerun()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # BLOCK 8 ── MASTER CONTROLLER
@@ -5518,6 +6133,7 @@ class ApplicationController:
         "maps":     "__nx_maps__",
         "pydeck":   "__nx_pydeck__",
         "zones":    "__nx_zones__",
+        "auth":     "__nx_auth__",
         "ui":       "__nx_ui__",
     }
 
@@ -5605,6 +6221,13 @@ class ApplicationController:
             st.session_state[k] = ZoneAnalyzer()
         return st.session_state[k]
 
+    def _get_auth(self) -> AuthManager:
+        k = self._SS["auth"]
+        if k not in st.session_state:
+            self.logger.info("Init AuthManager")
+            st.session_state[k] = AuthManager(db=self._get_db())
+        return st.session_state[k]
+
     def _get_ui(self) -> NexusUI:
         k = self._SS["ui"]
         if k not in st.session_state:
@@ -5619,6 +6242,7 @@ class ApplicationController:
                 maps     = self._get_maps(),
                 pydeck   = self._get_pydeck(),
                 zones    = self._get_zones(),
+                auth     = self._get_auth(),
             )
         return st.session_state[k]
 
