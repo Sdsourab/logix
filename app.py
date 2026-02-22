@@ -48,29 +48,25 @@ except ImportError:
         def argmax(x): return x.index(max(x)) if hasattr(x, "index") else 0
         float32 = float
 
-# ── TensorFlow / Keras — LAZY IMPORT (saves ~500 MB RAM on startup)
-# TF is only loaded when LSTM training is actually triggered.
-TF_AVAILABLE = False  # will be set True on first successful lazy import
+# ── TensorFlow / Keras — LAZY IMPORT (saves ~500 MB RAM on cold start)
+# Will only be imported the first time an LSTM forecast is requested.
+TF_AVAILABLE = False
 
-def _try_import_tf():
-    """Lazy-import TensorFlow. Returns True on success."""
+def _try_import_tf() -> bool:
+    """Lazy-import TensorFlow. Returns True on success, False if not installed."""
     global TF_AVAILABLE
     if TF_AVAILABLE:
         return True
     try:
-        import tensorflow as tf  # type: ignore  # noqa: F401
-        from tensorflow.keras.models import Sequential  # type: ignore  # noqa: F401
-        from tensorflow.keras.layers import LSTM, Dense, Dropout  # type: ignore  # noqa: F401
-        from tensorflow.keras.optimizers import Adam  # type: ignore  # noqa: F401
-        # Inject into module globals so existing code can reference them
-        import sys
-        _m = sys.modules[__name__]
-        setattr(_m, 'tf', tf)
-        setattr(_m, 'Sequential', Sequential)
-        setattr(_m, 'LSTM', LSTM)
-        setattr(_m, 'Dense', Dense)
-        setattr(_m, 'Dropout', Dropout)
-        setattr(_m, 'Adam', Adam)
+        import tensorflow as tf       # type: ignore
+        from tensorflow.keras.models import Sequential   # type: ignore
+        from tensorflow.keras.layers import LSTM, Dense, Dropout  # type: ignore
+        from tensorflow.keras.optimizers import Adam     # type: ignore
+        import sys; _m = sys.modules[__name__]
+        for _name, _obj in [("tf",tf),("Sequential",Sequential),
+                             ("LSTM",LSTM),("Dense",Dense),
+                             ("Dropout",Dropout),("Adam",Adam)]:
+            setattr(_m, _name, _obj)
         TF_AVAILABLE = True
         return True
     except ImportError:
@@ -479,8 +475,7 @@ class LiveDataScraper:
         if source in ("live_api", "live_search"):
             LiveDataScraper._last_good = {k: dict(v) for k, v in result.items()}
 
-        # Free any intermediate objects and help GC reclaim RAM
-        gc.collect()
+        gc.collect()   # reclaim any short-lived request/parse objects
         return result
 
     def fetch_weather_data(self) -> Dict[str, Any]:
@@ -1207,11 +1202,12 @@ class NexusDatabase:
             price  = base_pr[sku] * random.uniform(0.95, 1.08)
             zone   = zones[i % len(zones)]
             status = statuses[i % len(statuses)]
+            days_ago = random.randint(0, 30)
             self.execute_query(
                 "INSERT OR IGNORE INTO orders "
-                "(sku_id,quantity,unit_price,customer_id,zone,status) "
-                "VALUES (?,?,?,?,?,?)",
-                (sku, qty, round(price, 2), f"CUST{i+1:03d}", zone, status),
+                "(sku_id,quantity,unit_price,customer_id,zone,status,created_at) "
+                "VALUES (?,?,?,?,?,?,datetime('now',?))",
+                (sku, qty, round(price,2), f"CUST{i+1:03d}", zone, status, f"-{days_ago} days"),
             )
 
 
@@ -2049,10 +2045,9 @@ class SoptomAlgorithm:
             with cls._lstm_bg_lock:
                 cls._lstm_bg_cache[sku_id]    = result
                 cls._lstm_bg_training[sku_id] = False
-                # ── Memory guard: keep only the 8 most recently trained SKUs ──
-                if len(cls._lstm_bg_cache) > 8:
-                    oldest = next(iter(cls._lstm_bg_cache))
-                    del cls._lstm_bg_cache[oldest]
+                # Memory guard: keep only the 8 most-recent trained SKUs
+                while len(cls._lstm_bg_cache) > 8:
+                    cls._lstm_bg_cache.pop(next(iter(cls._lstm_bg_cache)))
 
             self.logger.info("LSTM background training complete for %s", sku_id)
 
@@ -3410,7 +3405,7 @@ class PyDeckRenderer:
             tooltip={"text": "{name} [{status}]\n{label}"},
             map_style="mapbox://styles/mapbox/dark-v10",
         )
-        st.pydeck_chart(deck)
+        st.pydeck_chart(deck, use_container_width=True)
 
     # ── Demand Hexagon + Column Maps ───────────────────────────────────────────
 
@@ -3460,7 +3455,7 @@ class PyDeckRenderer:
             tooltip={"text": "{name}\nDemand: {demand}"},
             map_style="mapbox://styles/mapbox/dark-v10",
         )
-        st.pydeck_chart(deck)
+        st.pydeck_chart(deck, use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3648,57 +3643,49 @@ summary { color:#7dd3fc!important; font-weight:600!important; }
 ::-webkit-scrollbar-thumb{background:#1e3a5f;border-radius:3px;}
 ::-webkit-scrollbar-thumb:hover{background:#00ff88;}
 
-/* ── MOBILE RESPONSIVE ──────────────────────────────────────────────────── */
+/* ══ MOBILE RESPONSIVE ══════════════════════════════════════════════════════ */
 @media (max-width: 768px) {
-    /* Sidebar collapses nicely on mobile */
-    [data-testid="stSidebar"] { width: 100% !important; }
-
-    /* Stack Streamlit columns vertically on mobile */
-    [data-testid="column"] {
-        min-width: 100% !important;
-        flex: 1 1 100% !important;
-    }
-
-    /* Metrics: 2 per row on mobile */
-    [data-testid="metric-container"] {
-        min-width: 45% !important;
-    }
-
-    /* Reduce font sizes for headings */
-    h1 { font-size: 1.4rem !important; }
-    h2 { font-size: 1.2rem !important; }
-    h3 { font-size: 1.05rem !important; }
-
-    /* Tab labels smaller */
-    [data-testid="stTabs"] [data-baseweb="tab"] {
-        font-size: .72rem !important;
-        padding: .4rem .5rem !important;
-    }
-
-    /* Cards full width */
-    .nx-card { padding: .85rem .95rem !important; }
-
-    /* Buttons full width on mobile */
-    .stButton > button { width: 100% !important; }
-
-    /* Tables: allow horizontal scroll */
-    [data-testid="stDataFrame"] { overflow-x: auto !important; }
-
-    /* Main content area: reduce side padding */
+    /* Reduce main content padding */
     .main .block-container {
-        padding-left: .75rem !important;
-        padding-right: .75rem !important;
-        padding-top: .75rem !important;
+        padding-left: .6rem !important;
+        padding-right: .6rem !important;
+        padding-top: .6rem !important;
+        max-width: 100% !important;
     }
+    /* Scale headings */
+    h1 { font-size: 1.35rem !important; }
+    h2 { font-size: 1.15rem !important; }
+    h3 { font-size: 1rem !important; }
+    /* Metrics: wrap to 2 per row */
+    [data-testid="metric-container"] {
+        min-width: 44% !important;
+        padding: .65rem .75rem !important;
+    }
+    [data-testid="stMetricValue"] { font-size: 1.2rem !important; }
+    /* Tabs smaller labels */
+    [data-testid="stTabs"] [data-baseweb="tab"] {
+        font-size: .68rem !important;
+        padding: .4rem .45rem !important;
+        min-width: 0 !important;
+    }
+    /* Cards */
+    .nx-card { padding: .8rem .9rem !important; }
+    /* Buttons full-width */
+    .stButton > button { width: 100% !important; }
+    /* DataFrames scroll horizontally */
+    [data-testid="stDataFrame"] { overflow-x: auto !important; }
+    /* Sidebar full-width on mobile */
+    [data-testid="stSidebar"] { width: 100% !important; min-width: 0 !important; }
+    /* Columns stack vertically */
+    [data-testid="column"] { min-width: 100% !important; flex: 1 1 100% !important; }
 }
 
 @media (max-width: 480px) {
-    /* Extra small phones */
+    h1 { font-size: 1.1rem !important; }
     [data-testid="metric-container"] { min-width: 100% !important; }
-    h1 { font-size: 1.2rem !important; }
     [data-testid="stTabs"] [data-baseweb="tab"] {
-        font-size: .65rem !important;
-        padding: .35rem .4rem !important;
+        font-size: .6rem !important;
+        padding: .3rem .35rem !important;
     }
 }
 </style>
@@ -3750,83 +3737,136 @@ def _source_badge(source: str) -> str:
 # BLOCK AUTH ── AUTHENTICATION & RBAC MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Minimal login-page CSS injected once
-_LOGIN_CSS = """
-<style>
-[data-testid="stAppViewContainer"] {
-    background: #0a0e1a !important;
-}
-[data-testid="stSidebar"] { display: none !important; }
+# Screen toggle key — "login" | "register"
+_AUTH_SCREEN_KEY = "__logix_auth_screen__"
 
-.logix-login-wrap {
-    display: flex; flex-direction: column; align-items: center;
-    justify-content: center; min-height: 88vh;
-}
-.logix-login-card {
-    background: linear-gradient(145deg, #0d1224 0%, #111827 100%);
+_AUTH_CSS = """
+<style>
+/* ── Page shell ───────────────────────────────────────────────────────────── */
+[data-testid="stAppViewContainer"] { background: #070b14 !important; }
+[data-testid="stSidebar"]          { display: none !important; }
+
+/* ── Card wrapper ─────────────────────────────────────────────────────────── */
+.lx-card {
+    background: linear-gradient(145deg,#0d1224 0%,#111827 100%);
     border: 1px solid #1e3a5f;
-    border-radius: 18px;
-    padding: 2.8rem 3rem 2.2rem;
-    width: 100%; max-width: 420px;
-    box-shadow: 0 8px 40px rgba(0,255,136,0.08);
+    border-radius: 20px;
+    padding: 2.6rem 2.8rem 2rem;
+    width: 100%;
+    max-width: 460px;
+    box-shadow: 0 12px 48px rgba(0,255,136,.09), 0 2px 8px rgba(0,0,0,.5);
 }
-.logix-login-logo {
-    font-size: 2.6rem; font-weight: 900; letter-spacing: 4px;
-    color: #00ff88; text-align: center; margin-bottom: 0.2rem;
+
+/* ── Logo ─────────────────────────────────────────────────────────────────── */
+.lx-logo {
+    font-size: 2.5rem; font-weight: 900; letter-spacing: 5px;
+    background: linear-gradient(90deg,#00ff88,#00cfff);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    text-align: center; margin-bottom: .2rem;
 }
-.logix-login-sub {
-    color: #4a6fa5; font-size: .82rem; text-align: center;
-    margin-bottom: 2rem; letter-spacing: .5px;
+.lx-sub {
+    color: #3a5a80; font-size: .78rem; text-align: center;
+    margin-bottom: .4rem; letter-spacing: .6px;
 }
-.logix-login-card input {
-    background: #0d1224 !important;
+
+/* ── Tab switcher ─────────────────────────────────────────────────────────── */
+.lx-tabs {
+    display: flex; border-radius: 10px; background: #0a0e1a;
+    border: 1px solid #1e2a44; overflow: hidden; margin: 1.2rem 0 1.4rem;
+}
+.lx-tab {
+    flex: 1; text-align: center; padding: .55rem 0; font-size: .85rem;
+    font-weight: 600; cursor: pointer; transition: background .2s, color .2s;
+    color: #3a5a80;
+}
+.lx-tab-active {
+    background: linear-gradient(135deg,#0d2040,#1a3a5c);
+    color: #00ff88;
+    border-bottom: 2px solid #00ff88;
+}
+
+/* ── Inputs ───────────────────────────────────────────────────────────────── */
+.lx-card input,
+.lx-card [data-testid="stTextInput"] input,
+.lx-card [data-testid="stSelectbox"] > div > div {
+    background: #0a0f1e !important;
     border: 1px solid #1e3a5f !important;
     color: #e0e8ff !important;
     border-radius: 8px !important;
+    font-size: .9rem !important;
 }
-/* Fix: use Streamlit's actual button class instead of [kind] attribute */
-.logix-login-card .stButton > button {
+.lx-card [data-testid="stTextInput"] label,
+.lx-card [data-testid="stSelectbox"] label { color: #5a7fa8 !important; font-size: .78rem !important; }
+
+/* ── Role badge row ───────────────────────────────────────────────────────── */
+.lx-role-row { display:flex; gap:.6rem; margin:.2rem 0 .8rem; flex-wrap:wrap; }
+.lx-role-chip {
+    flex:1; min-width:80px; text-align:center; padding:.5rem .4rem;
+    border-radius:8px; border:1px solid #1e3a5f; cursor:pointer;
+    font-size:.78rem; font-weight:600; color:#5a7fa8;
+    background:#0a0f1e; transition:all .18s;
+}
+.lx-role-chip:hover { border-color:#00ff88; color:#00ff88; }
+.lx-role-chip-active { border-color:#00ff88 !important; color:#00ff88 !important;
+    background:rgba(0,255,136,.08) !important; }
+
+/* ── Primary button ───────────────────────────────────────────────────────── */
+.lx-card .stButton > button {
     background: linear-gradient(90deg,#00ff88,#00cfff) !important;
-    color: #0a0e1a !important; font-weight: 700 !important;
-    border-radius: 8px !important; border: none !important;
+    color: #070b14 !important; font-weight: 700 !important;
+    border-radius: 10px !important; border: none !important;
     width: 100% !important; padding: .65rem !important;
+    font-size: .95rem !important; letter-spacing: .4px !important;
+    transition: opacity .18s !important;
 }
-.logix-login-error {
-    background: rgba(255,51,102,0.12);
-    border: 1px solid #ff3366;
-    border-radius: 8px; padding: .75rem 1rem;
-    color: #ff6b8a; font-size: .85rem; margin-top: .8rem;
-    text-align: center;
+.lx-card .stButton > button:hover { opacity: .88 !important; }
+
+/* ── Alert boxes ──────────────────────────────────────────────────────────── */
+.lx-error {
+    background: rgba(255,51,102,.1); border: 1px solid #ff3366;
+    border-radius: 8px; padding: .65rem 1rem; color: #ff6b8a;
+    font-size: .82rem; margin: .5rem 0; text-align: center;
 }
-.logix-login-hint {
-    color: #2a4a6a; font-size: .74rem; text-align: center;
-    margin-top: 1.2rem; line-height: 1.6;
+.lx-success {
+    background: rgba(0,255,136,.08); border: 1px solid #00ff88;
+    border-radius: 8px; padding: .65rem 1rem; color: #00ff88;
+    font-size: .82rem; margin: .5rem 0; text-align: center;
 }
-/* Mobile responsiveness for login */
+
+/* ── Divider hint ─────────────────────────────────────────────────────────── */
+.lx-hint {
+    color: #1e3a5f; font-size: .72rem; text-align: center;
+    margin-top: 1rem; line-height: 1.7;
+}
+
+/* ── Mobile ───────────────────────────────────────────────────────────────── */
 @media (max-width: 600px) {
-    .logix-login-card {
-        padding: 2rem 1.4rem 1.6rem;
-        border-radius: 14px;
-        max-width: 96vw;
-    }
-    .logix-login-logo { font-size: 2rem; }
+    .lx-card { padding: 2rem 1.2rem 1.5rem; border-radius: 14px; max-width: 96vw; }
+    .lx-logo { font-size: 2rem; letter-spacing: 3px; }
+    .lx-role-chip { padding: .45rem .25rem; font-size: .72rem; }
 }
 </style>
 """
 
+# Role display metadata for the registration chip selector
+_REG_ROLES = [
+    ("admin",      "🔴 Admin",      "Full access — all tabs, user management"),
+    ("manager",    "🟡 Manager",    "Inventory, AI intelligence, DSS Engine"),
+    ("dispatcher", "🔵 Dispatcher", "Live Map & Logistics only"),
+]
+
 
 class AuthManager:
     """
-    Authentication & Role-Based Access Control manager for LOGIX.
+    Authentication & Role-Based Access Control manager for LOGIX v7.2.
 
-    Responsibilities:
-    ─────────────────
-    • Render a dark-themed login screen matching LOGIX's design language.
-    • Validate credentials against the `users` SQLite table.
-    • Persist auth context in st.session_state[_AUTH_KEY].
-    • Provide role-checking helpers (is_admin, has_tab_access, etc.).
-    • Supply the log_action() audit helper used throughout NexusUI.
-    • Handle logout and session teardown.
+    Flow
+    ────
+    1. First-time visitor → 'Register' tab → choose role → create account
+    2. Returning user    → 'Sign In' tab  → enter credentials → enter app
+    3. Logout wipes session_state[_AUTH_KEY] and returns to Sign In tab.
+
+    Password security: bcrypt when available, PBKDF2-HMAC-SHA256 fallback.
     """
 
     def __init__(self, db: "NexusDatabase") -> None:
@@ -3836,16 +3876,10 @@ class AuthManager:
     # ── Public helpers ─────────────────────────────────────────────────────────
 
     def is_authenticated(self) -> bool:
-        """Return True if a valid auth context exists in session_state."""
         ctx = st.session_state.get(_AUTH_KEY, {})
         return bool(ctx.get("logged_in") and ctx.get("username"))
 
     def current_user(self) -> Dict[str, str]:
-        """
-        Return the current user context dict.
-        Keys: username, name, role, logged_in.
-        Returns an empty-ish dict when not authenticated.
-        """
         return st.session_state.get(_AUTH_KEY, {
             "username": "guest", "name": "Guest", "role": "dispatcher", "logged_in": False
         })
@@ -3857,20 +3891,13 @@ class AuthManager:
         return self.current_role() == "admin"
 
     def has_tab(self, tab_index: int) -> bool:
-        """Return True if the current role can view a given tab index."""
-        allowed = ROLE_TAB_ACCESS.get(self.current_role(), [])
-        return tab_index in allowed
+        return tab_index in ROLE_TAB_ACCESS.get(self.current_role(), [])
 
     def allowed_tabs(self) -> List[str]:
-        """Return the subset of ALL_TABS the current user may see."""
         allowed_indices = ROLE_TAB_ACCESS.get(self.current_role(), [])
         return [ALL_TABS[i] for i in sorted(allowed_indices)]
 
     def log_action(self, action_type: str, description: str) -> None:
-        """
-        Write an audit log entry for the currently authenticated user.
-        Safe to call even if no user is logged in (records 'anonymous').
-        """
         ctx = self.current_user()
         self.db.log_audit(
             username    = ctx.get("username", "anonymous"),
@@ -3879,104 +3906,254 @@ class AuthManager:
             description = description,
         )
 
-    # ── Login screen ───────────────────────────────────────────────────────────
+    # ── Main entry ─────────────────────────────────────────────────────────────
 
     def render_login(self) -> bool:
         """
-        Render the full-screen login UI.
-        Returns True immediately if the user is already authenticated.
-        Writes auth context to st.session_state[_AUTH_KEY] on success.
+        Renders the full-screen auth UI (Login OR Register).
+        Returns True only when the user is authenticated.
+        Streamlit's flow: if this returns False, the rest of the app does NOT render.
         """
         if self.is_authenticated():
             return True
 
-        # Inject login-page CSS (hides sidebar, applies dark card theme)
-        st.markdown(_LOGIN_CSS, unsafe_allow_html=True)
+        st.markdown(_AUTH_CSS, unsafe_allow_html=True)
 
-        # Centre the card using columns
-        _, col, _ = st.columns([1, 1.6, 1])
+        # Determine which screen to show
+        if _AUTH_SCREEN_KEY not in st.session_state:
+            st.session_state[_AUTH_SCREEN_KEY] = "login"
+
+        screen = st.session_state[_AUTH_SCREEN_KEY]
+
+        # Centre the card
+        _, col, _ = st.columns([1, 1.8, 1])
         with col:
+            # ── Logo ──────────────────────────────────────────────────────────
             st.markdown(
-                '<div class="logix-login-logo">LOGIX</div>'
-                '<div class="logix-login-sub">Supply Chain Intelligence Platform</div>',
+                '<div class="lx-logo">LOGIX</div>'
+                '<div class="lx-sub">Supply Chain Intelligence Platform</div>',
                 unsafe_allow_html=True,
             )
 
-            username = st.text_input(
-                "Username", placeholder="Enter your username", key="login_user"
-            )
-            password = st.text_input(
-                "Password", type="password", placeholder="Enter your password",
-                key="login_pass"
-            )
+            # ── Tab switcher (Login / Register) ───────────────────────────────
+            t1, t2 = st.columns(2)
+            with t1:
+                if st.button("🔐 Sign In",
+                             key="auth_tab_login",
+                             use_container_width=True,
+                             type="primary" if screen == "login" else "secondary"):
+                    st.session_state[_AUTH_SCREEN_KEY] = "login"
+                    st.rerun()
+            with t2:
+                if st.button("📝 Register",
+                             key="auth_tab_register",
+                             use_container_width=True,
+                             type="primary" if screen == "register" else "secondary"):
+                    st.session_state[_AUTH_SCREEN_KEY] = "register"
+                    st.rerun()
 
-            login_clicked = st.button(
-                "🔐 Sign In", type="primary", use_container_width=True, key="login_btn"
-            )
+            st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
 
-            # ── Credential validation ─────────────────────────────────────────
-            if login_clicked:
-                if not username.strip() or not password.strip():
-                    st.markdown(
-                        '<div class="logix-login-error">⚠️ Please enter both username and password.</div>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    user_row = self.db.get_user(username.strip().lower())
-                    if user_row and NexusDatabase.verify_password(password, user_row["hashed_password"]):
-                        # ── SUCCESS ──────────────────────────────────────────
-                        st.session_state[_AUTH_KEY] = {
-                            "logged_in": True,
-                            "username":  user_row["username"],
-                            "name":      user_row["name"],
-                            "role":      user_row["role"],
-                            "login_ts":  time.time(),
-                        }
-                        # Write audit entry
-                        self.db.log_audit(
-                            user_row["username"], user_row["role"],
-                            "AUTH_LOGIN",
-                            f"User '{user_row['name']}' logged in successfully.",
-                        )
-                        self.logger.info("Login: %s (%s)", user_row["username"], user_row["role"])
-                        st.rerun()
-                    else:
-                        # ── FAILURE ───────────────────────────────────────────
-                        self.logger.warning("Failed login attempt: username='%s'", username)
-                        # Log failed attempt (no user row needed)
-                        self.db.log_audit(
-                            username.strip().lower(), "unknown",
-                            "AUTH_FAILED",
-                            f"Failed login attempt for username '{username.strip().lower()}'.",
-                        )
-                        st.markdown(
-                            '<div class="logix-login-error">❌ Invalid username or password. Please try again.</div>',
-                            unsafe_allow_html=True,
-                        )
-
-            st.markdown(
-                '<div class="logix-login-hint">'
-                "Demo accounts — change in production:<br>"
-                "<b>admin</b> / Admin@1234 &nbsp;|&nbsp; "
-                "<b>manager</b> / Manager@456 &nbsp;|&nbsp; "
-                "<b>dispatcher</b> / Rider@789"
-                "</div>",
-                unsafe_allow_html=True,
-            )
+            # ── Route to the right form ────────────────────────────────────────
+            if screen == "login":
+                self._render_login_form()
+            else:
+                self._render_register_form()
 
         return self.is_authenticated()
 
+    # ── Login form ─────────────────────────────────────────────────────────────
+
+    def _render_login_form(self) -> None:
+        username = st.text_input("Username", placeholder="your username", key="li_user")
+        password = st.text_input("Password", type="password", placeholder="••••••••", key="li_pass")
+
+        st.markdown("<div style='height:.3rem'></div>", unsafe_allow_html=True)
+        clicked = st.button("🔐 Sign In", use_container_width=True, key="li_btn")
+
+        if clicked:
+            if not username.strip() or not password.strip():
+                st.markdown(
+                    '<div class="lx-error">⚠️ Please enter both username and password.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                user_row = self.db.get_user(username.strip().lower())
+                valid    = (user_row and
+                            NexusDatabase.verify_password(password, user_row["hashed_password"]))
+                if valid:
+                    st.session_state[_AUTH_KEY] = {
+                        "logged_in": True,
+                        "username":  user_row["username"],
+                        "name":      user_row["name"],
+                        "role":      user_row["role"],
+                        "login_ts":  time.time(),
+                    }
+                    self.db.log_audit(user_row["username"], user_row["role"],
+                                      "AUTH_LOGIN",
+                                      f"User '{user_row['name']}' logged in.")
+                    self.logger.info("Login OK: %s (%s)", user_row["username"], user_row["role"])
+                    # Clean up register state
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("reg_"):
+                            del st.session_state[k]
+                    st.rerun()
+                else:
+                    self.db.log_audit(
+                        username.strip().lower(), "unknown", "AUTH_FAILED",
+                        f"Failed login for '{username.strip().lower()}'.",
+                    )
+                    st.markdown(
+                        '<div class="lx-error">❌ Invalid username or password.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        st.markdown(
+            '<div class="lx-hint">'
+            'New here? Click <b>Register</b> above to create your account.<br>'
+            'Demo: <b>admin</b> / Admin@1234 &nbsp;·&nbsp; <b>manager</b> / Manager@456 &nbsp;·&nbsp; <b>dispatcher</b> / Rider@789'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Register form ──────────────────────────────────────────────────────────
+
+    def _render_register_form(self) -> None:
+        st.markdown(
+            "<p style='color:#5a7fa8;font-size:.82rem;margin-bottom:.8rem;'>"
+            "Create your LOGIX account. Choose your role carefully — it determines "
+            "which modules you can access.</p>",
+            unsafe_allow_html=True,
+        )
+
+        # ── Role selector ──────────────────────────────────────────────────────
+        st.markdown(
+            "<p style='color:#5a7fa8;font-size:.78rem;margin-bottom:.3rem;'>① Select your role</p>",
+            unsafe_allow_html=True,
+        )
+        if "reg_role" not in st.session_state:
+            st.session_state["reg_role"] = "dispatcher"
+
+        role_cols = st.columns(3)
+        for idx, (rval, rlabel, rdesc) in enumerate(_REG_ROLES):
+            with role_cols[idx]:
+                is_active = st.session_state["reg_role"] == rval
+                badge_style = (
+                    "background:rgba(0,255,136,.1);border:1.5px solid #00ff88;color:#00ff88;"
+                    if is_active else
+                    "background:#0a0f1e;border:1px solid #1e3a5f;color:#4a6fa5;"
+                )
+                st.markdown(
+                    f'<div style="{badge_style}border-radius:10px;padding:.55rem .3rem;'
+                    f'text-align:center;font-size:.78rem;font-weight:700;margin-bottom:.3rem;">'
+                    f'{rlabel}</div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    "✓ Select" if is_active else "Select",
+                    key=f"reg_role_btn_{rval}",
+                    use_container_width=True,
+                ):
+                    st.session_state["reg_role"] = rval
+                    st.rerun()
+                st.markdown(
+                    f'<div style="color:#2a4a6a;font-size:.67rem;text-align:center;'
+                    f'line-height:1.4;margin-bottom:.4rem;">{rdesc}</div>',
+                    unsafe_allow_html=True,
+                )
+
+        chosen_role = st.session_state.get("reg_role", "dispatcher")
+        role_meta   = ROLE_META.get(chosen_role, {"label": chosen_role, "color": "#7dd3fc"})
+        st.markdown(
+            f'<div style="background:rgba(0,207,255,.07);border:1px solid #1e3a5f;'
+            f'border-radius:8px;padding:.45rem .9rem;font-size:.8rem;color:{role_meta["color"]};'
+            f'margin-bottom:.8rem;">⬡ Role selected: <b>{role_meta["label"].upper()}</b></div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Account fields ─────────────────────────────────────────────────────
+        st.markdown(
+            "<p style='color:#5a7fa8;font-size:.78rem;margin-bottom:.3rem;'>② Fill in your details</p>",
+            unsafe_allow_html=True,
+        )
+        reg_name  = st.text_input("Full Name",        placeholder="e.g. Sourab Dey",    key="reg_name")
+        reg_user  = st.text_input("Username",          placeholder="lowercase, no spaces", key="reg_uname")
+        reg_email = st.text_input("Email",             placeholder="you@example.com",    key="reg_email")
+        reg_pass  = st.text_input("Password",          type="password",
+                                  placeholder="Min 8 chars — use letters + numbers",    key="reg_pass")
+        reg_pass2 = st.text_input("Confirm Password",  type="password",
+                                  placeholder="Repeat password",                         key="reg_pass2")
+
+        st.markdown("<div style='height:.3rem'></div>", unsafe_allow_html=True)
+        reg_clicked = st.button("✅ Create Account", use_container_width=True, key="reg_btn")
+
+        if reg_clicked:
+            # ── Validation ────────────────────────────────────────────────────
+            errors = []
+            if not all([reg_name.strip(), reg_user.strip(), reg_email.strip(),
+                        reg_pass.strip(), reg_pass2.strip()]):
+                errors.append("All fields are required.")
+            else:
+                if " " in reg_user.strip():
+                    errors.append("Username must not contain spaces.")
+                if not re.match(r"^[a-zA-Z0-9_.-]+$", reg_user.strip()):
+                    errors.append("Username may only contain letters, numbers, _ . -")
+                if "@" not in reg_email or "." not in reg_email.split("@")[-1]:
+                    errors.append("Please enter a valid email address.")
+                if len(reg_pass) < 8:
+                    errors.append("Password must be at least 8 characters.")
+                if reg_pass != reg_pass2:
+                    errors.append("Passwords do not match.")
+
+            if errors:
+                for err in errors:
+                    st.markdown(
+                        f'<div class="lx-error">⚠️ {err}</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                ok = self.db.create_user(
+                    reg_user.strip().lower(),
+                    reg_email.strip().lower(),
+                    reg_name.strip(),
+                    reg_pass,
+                    chosen_role,
+                )
+                if ok:
+                    self.db.log_audit(
+                        reg_user.strip().lower(), chosen_role,
+                        "AUTH_REGISTER",
+                        f"New account '{reg_user.strip()}' (role={chosen_role}) registered.",
+                    )
+                    self.logger.info("Registered: %s (%s)", reg_user.strip(), chosen_role)
+                    st.markdown(
+                        f'<div class="lx-success">🎉 Account <b>{reg_user.strip()}</b> created! '
+                        f'Switch to <b>Sign In</b> to log in.</div>',
+                        unsafe_allow_html=True,
+                    )
+                    # Auto-switch to login tab after a moment
+                    st.session_state[_AUTH_SCREEN_KEY] = "login"
+                else:
+                    st.markdown(
+                        '<div class="lx-error">❌ Username or email already exists. '
+                        'Try a different one or Sign In.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        st.markdown(
+            '<div class="lx-hint">Already have an account? Click <b>Sign In</b> above.</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Logout / profile badge ─────────────────────────────────────────────────
+
     def render_logout(self) -> None:
-        """
-        Render the profile badge + logout button inside the sidebar.
-        Call this at the TOP of NexusUI._sidebar().
-        """
         ctx  = self.current_user()
         role = ctx.get("role", "dispatcher")
         meta = ROLE_META.get(role, {"label": role.title(), "color": "#7dd3fc"})
 
         st.sidebar.markdown(
-            f"<div style='background:rgba(0,255,136,0.06);border:1px solid #1e3a5f;"
+            f"<div style='background:rgba(0,255,136,.06);border:1px solid #1e3a5f;"
             f"border-radius:10px;padding:.7rem 1rem;margin-bottom:.8rem;'>"
             f"<span style='font-size:1.1rem;'>👤</span> "
             f"<b style='color:#e0e8ff;'>{ctx.get('name','?')}</b><br>"
@@ -3988,11 +4165,12 @@ class AuthManager:
         )
 
         if st.sidebar.button("🚪 Logout", use_container_width=True, key="logout_btn"):
-            # Audit the logout event before clearing state
             self.log_action("AUTH_LOGOUT", f"User '{ctx.get('name')}' logged out.")
-            # Wipe auth context but keep other state intact
             st.session_state.pop(_AUTH_KEY, None)
+            st.session_state[_AUTH_SCREEN_KEY] = "login"
             st.rerun()
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4181,15 +4359,15 @@ class NexusUI:
         stats     = self.db.get_order_stats()
         revenue   = stats.get("revenue") or 0
 
-        # ── KPI row: 3+3 split so mobile renders 2 neat rows instead of overflow ──
+        # KPI row — two rows of 3 so mobile doesn't get 6 squished columns
         r1c1, r1c2, r1c3 = st.columns(3)
-        r1c1.metric("📦 Total Stock",    f"{total_stk:,}")
-        r1c2.metric("⚠️ Low Stock",      low_cnt,   delta=None, delta_color="inverse")
-        r1c3.metric("🕐 Expiry Alerts",  exp_warn,  delta=None, delta_color="inverse")
+        r1c1.metric("📦 Total Stock",   f"{total_stk:,}")
+        r1c2.metric("⚠️ Low Stock",     low_cnt,  delta=None, delta_color="inverse")
+        r1c3.metric("🕐 Expiry Alerts", exp_warn, delta=None, delta_color="inverse")
         r2c1, r2c2, r2c3 = st.columns(3)
-        r2c1.metric("💰 Revenue (৳)",    f"{revenue:,.0f}")
-        r2c2.metric("📋 Total Orders",   stats.get("total",0))
-        r2c3.metric("✅ Delivered",       stats.get("delivered",0))
+        r2c1.metric("💰 Revenue (৳)",   f"{revenue:,.0f}")
+        r2c2.metric("📋 Total Orders",  stats.get("total",0))
+        r2c3.metric("✅ Delivered",      stats.get("delivered",0))
 
         st.divider()
 
@@ -6225,74 +6403,61 @@ document.getElementById('abcG').innerHTML =
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-# ── Memory-efficient singleton factories using st.cache_resource ─────────────
-# cache_resource stores ONE instance per process (not per session), which
-# dramatically reduces RAM usage compared to session_state-per-user storage.
+# ── Process-level singletons via @st.cache_resource ──────────────────────────
+# ONE instance shared across ALL sessions/reruns → 70-80% RAM reduction vs
+# storing heavy objects in st.session_state (which creates a copy per user).
 
 @st.cache_resource(show_spinner=False)
-def _get_db_singleton() -> NexusDatabase:
-    logging.getLogger("LogixApp").info("Init NexusDatabase (cache_resource)")
-    return NexusDatabase(DB_PATH)
+def _singleton_db()       -> NexusDatabase:   return NexusDatabase(DB_PATH)
 
 @st.cache_resource(show_spinner=False)
-def _get_scraper_singleton() -> LiveDataScraper:
-    logging.getLogger("LogixApp").info("Init LiveDataScraper (cache_resource)")
-    return LiveDataScraper()
+def _singleton_scraper()  -> LiveDataScraper:  return LiveDataScraper()
 
 @st.cache_resource(show_spinner=False)
-def _get_soptom_singleton() -> "SoptomAlgorithm":
-    logging.getLogger("LogixApp").info("Init SoptomAlgorithm (cache_resource)")
-    return SoptomAlgorithm(db=_get_db_singleton())
+def _singleton_soptom()   -> SoptomAlgorithm:  return SoptomAlgorithm(db=_singleton_db())
 
 @st.cache_resource(show_spinner=False)
-def _get_dss_singleton() -> DSSEngine:
-    return DSSEngine()
+def _singleton_dss()      -> DSSEngine:        return DSSEngine()
 
 @st.cache_resource(show_spinner=False)
-def _get_business_singleton() -> BusinessEngine:
-    return BusinessEngine(_get_db_singleton())
+def _singleton_business() -> BusinessEngine:   return BusinessEngine(_singleton_db())
 
 @st.cache_resource(show_spinner=False)
-def _get_routing_singleton() -> RoutingEngine:
-    return RoutingEngine()
+def _singleton_routing()  -> RoutingEngine:    return RoutingEngine()
 
 @st.cache_resource(show_spinner=False)
-def _get_maps_singleton() -> MapRenderer:
-    return MapRenderer()
+def _singleton_maps()     -> MapRenderer:      return MapRenderer()
 
 @st.cache_resource(show_spinner=False)
-def _get_pydeck_singleton() -> PyDeckRenderer:
-    return PyDeckRenderer()
+def _singleton_pydeck()   -> PyDeckRenderer:   return PyDeckRenderer()
 
 @st.cache_resource(show_spinner=False)
-def _get_zones_singleton() -> ZoneAnalyzer:
-    return ZoneAnalyzer()
+def _singleton_zones()    -> ZoneAnalyzer:     return ZoneAnalyzer()
 
 @st.cache_resource(show_spinner=False)
-def _get_auth_singleton() -> AuthManager:
-    return AuthManager(db=_get_db_singleton())
+def _singleton_auth()     -> AuthManager:      return AuthManager(db=_singleton_db())
 
 @st.cache_resource(show_spinner=False)
-def _get_ui_singleton() -> "NexusUI":
+def _singleton_ui()       -> "NexusUI":
     return NexusUI(
-        db       = _get_db_singleton(),
-        scraper  = _get_scraper_singleton(),
-        soptom   = _get_soptom_singleton(),
-        dss      = _get_dss_singleton(),
-        business = _get_business_singleton(),
-        routing  = _get_routing_singleton(),
-        maps     = _get_maps_singleton(),
-        pydeck   = _get_pydeck_singleton(),
-        zones    = _get_zones_singleton(),
-        auth     = _get_auth_singleton(),
+        db       = _singleton_db(),
+        scraper  = _singleton_scraper(),
+        soptom   = _singleton_soptom(),
+        dss      = _singleton_dss(),
+        business = _singleton_business(),
+        routing  = _singleton_routing(),
+        maps     = _singleton_maps(),
+        pydeck   = _singleton_pydeck(),
+        zones    = _singleton_zones(),
+        auth     = _singleton_auth(),
     )
 
 
 class ApplicationController:
     """
-    Application orchestrator.
-    Heavy objects are built once per process via @st.cache_resource
-    (not per session), massively reducing RAM usage on Streamlit Cloud.
+    Thin orchestrator.  All heavy objects live in @st.cache_resource singletons
+    (process-level, not per-session) so RAM stays flat regardless of how many
+    browser sessions are open or how many times the page is refreshed.
     """
 
     def __init__(self) -> None:
@@ -6300,12 +6465,12 @@ class ApplicationController:
 
     def start(self) -> None:
         try:
-            self._init_defaults()
-            _get_ui_singleton().render()
+            self._init_session_defaults()
+            _singleton_ui().render()
         except Exception as exc:
             self._error_page(exc)
 
-    def _init_defaults(self) -> None:
+    def _init_session_defaults(self) -> None:
         for key, val in {
             "market_event": "Normal Day",
             "forecasts":    {},
