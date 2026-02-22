@@ -3896,13 +3896,19 @@ class AuthManager:
             st.rerun()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# BLOCK 7 ── PRESENTATION LAYER (NEXUS UI)
+# ═══════════════════════════════════════════════════════════════════════════════
 
+class NexusUI:
     """
-    Full Streamlit 10-tab UI for LOGIX v7.0.
+    Full Streamlit 10-tab UI for LOGIX v7.2.
     Developer: Sourab Dey Soptom.
 
-    FIX: All download_button calls are placed unconditionally (not inside
-    if-button blocks) to avoid StreamlitAPIException: Invalid binary data format.
+    RBAC-aware: render() checks AuthManager before drawing any content.
+    Tab set is built dynamically from ROLE_TAB_ACCESS for the active session role.
+    All destructive actions are gated behind is_admin() checks.
+    Audit trail written via log_action() on key mutations.
     """
 
     def __init__(self, db: NexusDatabase, scraper: LiveDataScraper,
