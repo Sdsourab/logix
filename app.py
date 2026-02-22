@@ -79,6 +79,28 @@ try:
 except ImportError:
     PANDAS_AVAILABLE = False
 
+# ── PyDeck (WebGL-powered 3D map renderer — Uber Deck.gl)
+try:
+    import pydeck as pdk  # type: ignore
+    PYDECK_AVAILABLE = True
+except ImportError:
+    PYDECK_AVAILABLE = False
+
+# ── polyline decoder (OSRM route geometry)
+try:
+    import polyline as _polyline_lib  # type: ignore
+    POLYLINE_AVAILABLE = True
+except ImportError:
+    POLYLINE_AVAILABLE = False
+
+# ── GeoPandas + Shapely (Point-in-Polygon zone analysis)
+try:
+    import geopandas as gpd       # type: ignore
+    from shapely.geometry import Point, Polygon  # type: ignore
+    GEOPANDAS_AVAILABLE = True
+except ImportError:
+    GEOPANDAS_AVAILABLE = False
+
 # ── dotenv
 try:
     from dotenv import load_dotenv
@@ -105,7 +127,7 @@ logger = logging.getLogger("LogixApp")
 # GLOBAL CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION   = "7.0.0"
+APP_VERSION   = "7.1.0"
 APP_NAME      = "LOGIX"
 DEVELOPER     = "Sourab Dey Soptom"
 DB_PATH       = "logix_v7.db"
@@ -2293,17 +2315,117 @@ class BusinessEngine:
 
 class RoutingEngine:
     """
-    Dijkstra-based delivery routing with hub closure and multi-stop TSP.
+    Advanced delivery routing engine.
+
+    Routing priority:
+    ─────────────────
+    1. OSRM (Open Source Routing Machine) public API — real road geometry,
+       actual distance & ETA, returns polyline for map rendering.
+    2. NetworkX Dijkstra on hardcoded HUB_EDGES — fallback when OSRM unavailable.
+    3. Haversine straight-line — last resort when networkx not installed.
     """
 
     AVG_SPEED_KMH    = 25.0
     VEHICLE_CAPACITY = 30
+    OSRM_BASE        = "http://router.project-osrm.org/route/v1/driving"
+    OSRM_TIMEOUT     = 6   # seconds — keep UI responsive
 
     def __init__(self) -> None:
         self.logger       = logging.getLogger(self.__class__.__name__)
         self._closed_hubs: set = set()
 
+    # ── OSRM real-time routing ─────────────────────────────────────────────────
+
+    def _osrm_route(self, origin: Tuple[float, float], destination: Tuple[float, float]) -> Optional[Dict]:
+        """
+        Call OSRM public demo server for a real road route.
+        Returns dict with distance_km, duration_min, route_coords (list of [lat,lon]).
+        Returns None on any failure so callers can fall back gracefully.
+        """
+        if not BS4_AVAILABLE:          # reuse requests availability flag
+            return None
+        try:
+            lat1, lon1 = origin
+            lat2, lon2 = destination
+            url = (
+                f"{self.OSRM_BASE}/{lon1},{lat1};{lon2},{lat2}"
+                f"?overview=full&geometries=polyline"
+            )
+            resp = requests.get(url, timeout=self.OSRM_TIMEOUT)
+            data = resp.json()
+            if data.get("code") != "Ok":
+                return None
+            route_info = data["routes"][0]
+            distance_km  = round(route_info["distance"] / 1000.0, 2)
+            duration_min = round(route_info["duration"] / 60.0, 1)
+            encoded      = route_info["geometry"]
+            # Decode polyline → list of [lat, lon]
+            if POLYLINE_AVAILABLE:
+                route_coords = _polyline_lib.decode(encoded)
+            else:
+                # Minimal inline decoder for polyline5 format
+                route_coords = self._decode_polyline(encoded)
+            return {
+                "distance_km":  distance_km,
+                "duration_min": duration_min,
+                "route_coords": route_coords,   # list of (lat, lon) tuples
+            }
+        except Exception as exc:
+            self.logger.warning("OSRM call failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _decode_polyline(encoded: str) -> List[Tuple[float, float]]:
+        """Inline polyline5 decoder (no external library needed)."""
+        coords, idx, lat, lng = [], 0, 0, 0
+        while idx < len(encoded):
+            for coord_ref in [lat, lng]:
+                result, shift, b = 0, 0, 0
+                while True:
+                    if idx >= len(encoded):
+                        break
+                    b = ord(encoded[idx]) - 63
+                    idx += 1
+                    result |= (b & 0x1F) << shift
+                    shift  += 5
+                    if b < 0x20:
+                        break
+                coord_change = ~(result >> 1) if (result & 1) else (result >> 1)
+                if coord_ref is lat:
+                    lat += coord_change
+                else:
+                    lng += coord_change
+            coords.append((lat / 1e5, lng / 1e5))
+        return coords
+
     def find_optimal_route(self, source: str, target: str, mode: str = "balanced") -> Dict[str, Any]:
+        src_coords = DHAKA_HUBS.get(source)
+        dst_coords = DHAKA_HUBS.get(target)
+
+        # ── Try OSRM first ─────────────────────────────────────────────────────
+        osrm_result = None
+        if src_coords and dst_coords and mode != "distance":
+            osrm_result = self._osrm_route(src_coords, dst_coords)
+
+        if osrm_result:
+            trad_km = osrm_result["distance_km"] * 1.30
+            savings = self._savings(trad_km, osrm_result["distance_km"])
+            return {
+                "path":            [source, target],
+                "total_km":        osrm_result["distance_km"],
+                "eta_min":         osrm_result["duration_min"],
+                "traffic_factor":  round(osrm_result["duration_min"] /
+                                         max((osrm_result["distance_km"] / self.AVG_SPEED_KMH * 60), 1), 2),
+                "hops":            1,
+                "traditional_km":  round(trad_km, 2),
+                "co2_saving_kg":   savings["co2_saved"],
+                "cost_saving_bdt": savings["cost_saved"],
+                "mode":            "osrm_realtime",
+                "route_coords":    osrm_result["route_coords"],   # ← real road polyline
+                "data_source":     "OSRM",
+            }
+
+        # ── Fallback: NetworkX Dijkstra on HUB_EDGES ──────────────────────────
         if not NX_AVAILABLE:
             return self._haversine_route(source, target)
         G = self._build_graph(mode=mode)
@@ -2339,6 +2461,7 @@ class RoutingEngine:
             "co2_saving_kg":   savings["co2_saved"],
             "cost_saving_bdt": savings["cost_saved"],
             "mode":            mode,
+            "data_source":     "NetworkX",
         }
 
     def plan_multi_stop(self, hubs: List[str], optimize: bool = True) -> Dict[str, Any]:
@@ -2558,16 +2681,21 @@ class MapRenderer:
                 for h in route_result["path"]
                 if h in DHAKA_HUBS
             ]
-            if len(path_coords) >= 2:
+            # Prefer real OSRM road polyline over straight hub-to-hub line
+            osrm_coords = route_result.get("route_coords")
+            draw_coords = [[lat, lon] for lat, lon in osrm_coords] if osrm_coords else path_coords
+            data_src    = route_result.get("data_source", "NetworkX")
+
+            if len(draw_coords) >= 2:
                 route_layer = fl.FeatureGroup(name="Active Route", show=True)
                 fl.PolyLine(
-                    locations  = path_coords,
+                    locations  = draw_coords,
                     color      = self.COLORS["route"],
                     weight     = 5,
                     opacity    = 0.95,
                     dash_array = "10 6",
                     tooltip    = (
-                        f"<b>Optimal Route</b><br>"
+                        f"<b>Optimal Route [{data_src}]</b><br>"
                         f"Path: {' > '.join(route_result.get('path', []))}<br>"
                         f"Dist: {route_result.get('total_km', '?')} km<br>"
                         f"ETA: {route_result.get('eta_min', '?')} min"
@@ -2575,7 +2703,7 @@ class MapRenderer:
                 ).add_to(route_layer)
                 try:
                     self._fl_plugins.AntPath(
-                        locations   = path_coords,
+                        locations   = draw_coords,
                         color       = self.COLORS["route"],
                         weight      = 4,
                         delay       = 800,
@@ -2583,7 +2711,7 @@ class MapRenderer:
                     ).add_to(route_layer)
                 except Exception:
                     pass
-                for coord in [path_coords[0], path_coords[-1]]:
+                for coord in [draw_coords[0], draw_coords[-1]]:
                     fl.CircleMarker(
                         location     = coord,
                         radius       = 10,
@@ -2907,9 +3035,313 @@ class MapRenderer:
         m.get_root().html.add_child(fl.Element(legend_html))
         return m
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# BLOCK 7 ── PRESENTATION LAYER (NEXUS UI)
+# ADVANCED GIS MODULE A ── PYDECK 3D/ARC MAP RENDERER (Deck.gl WebGL)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+class PyDeckRenderer:
+    """
+    WebGL-powered advanced map renderer using PyDeck (Deck.gl by Uber).
+
+    Advantages over Folium:
+    • Renders thousands of data points without UI lag (GPU-accelerated)
+    • ArcLayer — animated 3D arcs between delivery hubs
+    • ScatterplotLayer — demand bubbles with GPU interpolation
+    • ColumnLayer  — 3D revenue columns per zone
+    • HexagonLayer — density heatmap for order clusters
+
+    Requirements:  pip install pydeck
+    """
+
+    DHAKA_CENTER = {"longitude": 90.4007, "latitude": 23.7808, "zoom": 11, "pitch": 45}
+
+    COLORS_RGB = {
+        "hub_open":  [0,  255, 136],    # #00ff88
+        "hub_closed":[255, 51, 102],    # #ff3366
+        "arc_src":   [0,  207, 255],    # #00cfff
+        "arc_dst":   [255, 187,  0],    # #ffbb00
+        "demand":    [255, 107,  53],   # #ff6b35
+        "revenue":   [0,  255, 136],    # #00ff88
+        "rider":     [192, 132, 252],   # #c084fc
+    }
+
+    def __init__(self) -> None:
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    def _not_available(self) -> None:
+        st.warning(
+            "**pydeck** is not installed. Run: `pip install pydeck`\n\n"
+            "Falling back to Folium maps."
+        )
+
+    # ── Hub Arc Map ────────────────────────────────────────────────────────────
+
+    def render_arc_map(
+        self,
+        hub_metrics:  List[Dict],
+        route_result: Optional[Dict] = None,
+        closed_hubs:  Optional[List[str]] = None,
+    ) -> None:
+        """
+        Renders an animated 3D arc map.
+        Each hub edge is drawn as a curved arc coloured by traffic.
+        Active route arcs are highlighted in bright cyan.
+        """
+        if not PYDECK_AVAILABLE:
+            self._not_available(); return
+
+        closed = set(closed_hubs or [])
+        metric_map = {hm["hub"]: hm for hm in hub_metrics}
+
+        # ── ScatterplotLayer: hub nodes ───────────────────────────────────────
+        hub_data = []
+        for name, (lat, lon) in DHAKA_HUBS.items():
+            hm = metric_map.get(name, {})
+            is_closed = name in closed
+            centrality = hm.get("centrality", 0.3)
+            hub_data.append({
+                "name":       name,
+                "coordinates":[lon, lat],
+                "color":      self.COLORS_RGB["hub_closed"] if is_closed
+                              else self.COLORS_RGB["hub_open"],
+                "radius":     int(200 + centrality * 600),
+                "status":     "CLOSED" if is_closed else "OPEN",
+            })
+
+        scatter_layer = pdk.Layer(
+            "ScatterplotLayer",
+            hub_data,
+            get_position="coordinates",
+            get_color="color",
+            get_radius="radius",
+            pickable=True,
+            opacity=0.85,
+            stroked=True,
+            filled=True,
+            radius_min_pixels=6,
+            radius_max_pixels=30,
+        )
+
+        # ── ArcLayer: hub edges ────────────────────────────────────────────────
+        arc_data = []
+        active_path = set()
+        if route_result and "path" in route_result:
+            p = route_result["path"]
+            for i in range(len(p) - 1):
+                active_path.add((p[i], p[i+1]))
+                active_path.add((p[i+1], p[i]))
+
+        for hub_a, hub_b, km, traffic in HUB_EDGES:
+            if hub_a not in DHAKA_HUBS or hub_b not in DHAKA_HUBS:
+                continue
+            is_active = (hub_a, hub_b) in active_path
+            if traffic < 1.3:
+                color = [42, 157, 143]       # green-teal — low traffic
+            elif traffic < 1.6:
+                color = [233, 196, 106]      # amber — moderate
+            else:
+                color = [231, 111,  81]      # red-orange — heavy
+            if is_active:
+                color = [0, 207, 255]        # bright cyan — active route
+
+            la, loa = DHAKA_HUBS[hub_a]
+            lb, lob = DHAKA_HUBS[hub_b]
+            arc_data.append({
+                "from": {"coordinates": [loa, la]},
+                "to":   {"coordinates": [lob, lb]},
+                "color": color,
+                "label": f"{hub_a}→{hub_b}: {km}km x{traffic}",
+                "is_active": is_active,
+            })
+
+        arc_layer = pdk.Layer(
+            "ArcLayer",
+            arc_data,
+            get_source_position="from.coordinates",
+            get_target_position="to.coordinates",
+            get_source_color="color",
+            get_target_color="color",
+            get_width=lambda d: 5 if d.get("is_active") else 2,
+            auto_highlight=True,
+            pickable=True,
+            width_scale=1,
+            width_min_pixels=1,
+        )
+
+        # ── OSRM road polyline (PathLayer) ─────────────────────────────────────
+        layers = [arc_layer, scatter_layer]
+        if route_result:
+            route_coords = route_result.get("route_coords")
+            if route_coords:
+                path_data = [{"path": [[lon, lat] for lat, lon in route_coords],
+                               "color": [0, 207, 255]}]
+                path_layer = pdk.Layer(
+                    "PathLayer",
+                    path_data,
+                    get_path="path",
+                    get_color="color",
+                    width_scale=20,
+                    width_min_pixels=3,
+                    pickable=True,
+                )
+                layers.insert(0, path_layer)
+
+        view = pdk.ViewState(**self.DHAKA_CENTER)
+        deck = pdk.Deck(
+            layers=layers,
+            initial_view_state=view,
+            tooltip={"text": "{name} [{status}]\n{label}"},
+            map_style="mapbox://styles/mapbox/dark-v10",
+        )
+        st.pydeck_chart(deck, use_container_width=True)
+
+    # ── Demand Hexagon + Column Maps ───────────────────────────────────────────
+
+    def render_demand_columns(
+        self,
+        zone_demand: Dict[str, float],
+    ) -> None:
+        """
+        3D extruded columns per hub — height ∝ demand value.
+        Much faster than Folium CircleMarkers for large datasets.
+        """
+        if not PYDECK_AVAILABLE:
+            self._not_available(); return
+
+        max_val = max(zone_demand.values()) or 1.0
+        col_data = []
+        for name, (lat, lon) in DHAKA_HUBS.items():
+            demand = zone_demand.get(name, 0)
+            ratio  = demand / max_val
+            elevation = int(ratio * 5000)
+            r = int(255 * ratio)
+            g = int(107 * (1 - ratio))
+            col_data.append({
+                "name":        name,
+                "coordinates": [lon, lat],
+                "elevation":   elevation,
+                "color":       [r, 107, 53, 180],
+                "demand":      int(demand),
+            })
+
+        col_layer = pdk.Layer(
+            "ColumnLayer",
+            col_data,
+            get_position="coordinates",
+            get_elevation="elevation",
+            get_fill_color="color",
+            elevation_scale=1,
+            radius=400,
+            pickable=True,
+            extruded=True,
+            coverage=0.9,
+        )
+        view = pdk.ViewState(**{**self.DHAKA_CENTER, "pitch": 55, "zoom": 11})
+        deck = pdk.Deck(
+            layers=[col_layer],
+            initial_view_state=view,
+            tooltip={"text": "{name}\nDemand: {demand}"},
+            map_style="mapbox://styles/mapbox/dark-v10",
+        )
+        st.pydeck_chart(deck, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADVANCED GIS MODULE B ── ZONE ANALYZER (GeoPandas Point-in-Polygon)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Approximate Dhaka zone polygons (bounding boxes as proxies for real GeoJSON).
+# In production, replace these with proper shapefiles from OSM or BBS.
+DHAKA_ZONE_POLYGONS: Dict[str, List[Tuple[float, float]]] = {
+    "Gulshan":     [(23.760, 90.390), (23.760, 90.425), (23.810, 90.425), (23.810, 90.390)],
+    "Dhanmondi":   [(23.730, 90.360), (23.730, 90.395), (23.760, 90.395), (23.760, 90.360)],
+    "Mirpur":      [(23.800, 90.345), (23.800, 90.385), (23.845, 90.385), (23.845, 90.345)],
+    "Uttara":      [(23.855, 90.360), (23.855, 90.400), (23.900, 90.400), (23.900, 90.360)],
+    "Motijheel":   [(23.715, 90.410), (23.715, 90.430), (23.745, 90.430), (23.745, 90.410)],
+    "Mohakhali":   [(23.765, 90.395), (23.765, 90.420), (23.795, 90.420), (23.795, 90.395)],
+    "Badda":       [(23.760, 90.420), (23.760, 90.445), (23.800, 90.445), (23.800, 90.420)],
+    "Rayer Bazar": [(23.735, 90.345), (23.735, 90.370), (23.765, 90.370), (23.765, 90.345)],
+    "Wari":        [(23.710, 90.405), (23.710, 90.425), (23.730, 90.425), (23.730, 90.405)],
+}
+
+
+class ZoneAnalyzer:
+    """
+    Point-in-Polygon (PIP) zone assignment using GeoPandas + Shapely.
+
+    Usage:
+      za = ZoneAnalyzer()
+      zone = za.get_zone(23.775, 90.408)   # → "Mohakhali"
+      hub  = za.assign_nearest_hub(23.775, 90.408)  # → "Mohakhali"
+
+    Falls back to nearest-centroid (Haversine) when GeoPandas is unavailable.
+    """
+
+    def __init__(self) -> None:
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self._gdf: Optional[Any] = None
+        if GEOPANDAS_AVAILABLE:
+            self._build_gdf()
+
+    def _build_gdf(self) -> None:
+        """Build a GeoDataFrame from the approximate zone polygons."""
+        try:
+            records = []
+            for zone_name, coords in DHAKA_ZONE_POLYGONS.items():
+                poly = Polygon([(lon, lat) for lat, lon in coords])
+                records.append({"zone": zone_name, "geometry": poly})
+            self._gdf = gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
+            self.logger.info("ZoneAnalyzer: GeoPandas GDF built (%d zones)", len(records))
+        except Exception as exc:
+            self.logger.error("ZoneAnalyzer GDF build failed: %s", exc)
+            self._gdf = None
+
+    def get_zone(self, lat: float, lon: float) -> Optional[str]:
+        """
+        Return the zone name that contains the point (lat, lon).
+        Uses Point-in-Polygon if GeoPandas is available; otherwise None.
+        """
+        if self._gdf is not None:
+            try:
+                pt = Point(lon, lat)
+                hits = self._gdf[self._gdf.geometry.contains(pt)]
+                if not hits.empty:
+                    return hits.iloc[0]["zone"]
+            except Exception as exc:
+                self.logger.warning("PIP failed: %s", exc)
+        return None
+
+    def assign_nearest_hub(self, lat: float, lon: float) -> str:
+        """
+        Return the hub whose centroid is closest to (lat, lon).
+        First tries PIP zone assignment; falls back to Haversine nearest-centroid.
+        """
+        zone = self.get_zone(lat, lon)
+        if zone and zone in DHAKA_HUBS:
+            return zone
+        # Haversine fallback
+        def haversine(p1, p2):
+            R = 6371.0
+            la1, lo1 = math.radians(p1[0]), math.radians(p1[1])
+            la2, lo2 = math.radians(p2[0]), math.radians(p2[1])
+            a = math.sin((la2-la1)/2)**2 + math.cos(la1)*math.cos(la2)*math.sin((lo2-lo1)/2)**2
+            return R * 2 * math.asin(math.sqrt(a))
+        return min(DHAKA_HUBS.keys(), key=lambda h: haversine(DHAKA_HUBS[h], (lat, lon)))
+
+    def zone_summary(self) -> str:
+        """Return a Markdown table of zones and their centroid hubs."""
+        lines = ["| Zone | Center Hub | GDF Status |",
+                 "|------|-----------|-----------|"]
+        for z in DHAKA_ZONE_POLYGONS:
+            center_lat = sum(c[0] for c in DHAKA_ZONE_POLYGONS[z]) / 4
+            center_lon = sum(c[1] for c in DHAKA_ZONE_POLYGONS[z]) / 4
+            hub = self.assign_nearest_hub(center_lat, center_lon)
+            pip = "✅ PIP" if self._gdf is not None else "⚠️ Haversine"
+            lines.append(f"| {z} | {hub} | {pip} |")
+        return "\n".join(lines)
+
+
 
 # ── Global CSS ────────────────────────────────────────────────────────────────
 
@@ -3058,7 +3490,9 @@ class NexusUI:
     def __init__(self, db: NexusDatabase, scraper: LiveDataScraper,
                  soptom: SoptomAlgorithm, dss: DSSEngine,
                  business: BusinessEngine, routing: RoutingEngine,
-                 maps: MapRenderer) -> None:
+                 maps: MapRenderer,
+                 pydeck: Optional[Any] = None,
+                 zones:  Optional[Any] = None) -> None:
         self.db       = db
         self.scraper  = scraper
         self.soptom   = soptom
@@ -3066,6 +3500,8 @@ class NexusUI:
         self.business = business
         self.routing  = routing
         self.maps     = maps
+        self.pydeck   = pydeck   # PyDeckRenderer — may be None
+        self.zones    = zones    # ZoneAnalyzer   — may be None
         self.logger   = logging.getLogger(self.__class__.__name__)
 
     # ── Entry point ───────────────────────────────────────────────────────────
@@ -4506,17 +4942,28 @@ document.getElementById('abcG').innerHTML =
 
                 with col_map:
                     route_state  = st.session_state.get("last_route")
-                    hub_folium_m = self.maps.render_hub_map(
-                        hub_metrics, route_state, closed_hubs
+
+                    # ── Map engine selector ───────────────────────────────────
+                    map_engine = st.radio(
+                        "Map Engine",
+                        ["Folium (2D)", "PyDeck 3D (WebGL)"],
+                        horizontal=True,
+                        key="hub_map_engine",
                     )
-                    if hub_folium_m is not None:
-                        st_folium(
-                            hub_folium_m,
-                            width            = "100%",
-                            height           = 540,
-                            returned_objects = [],
-                            key              = "hub_map",
+                    if map_engine == "PyDeck 3D (WebGL)" and self.pydeck:
+                        self.pydeck.render_arc_map(hub_metrics, route_state, closed_hubs)
+                    else:
+                        hub_folium_m = self.maps.render_hub_map(
+                            hub_metrics, route_state, closed_hubs
                         )
+                        if hub_folium_m is not None:
+                            st_folium(
+                                hub_folium_m,
+                                width            = "100%",
+                                height           = 540,
+                                returned_objects = [],
+                                key              = "hub_map",
+                            )
 
             # ── Tab: Route Planner ────────────────────────────────────────────────
             with t_route:
@@ -4542,7 +4989,11 @@ document.getElementById('abcG').innerHTML =
                             c2.metric("ETA",       f'{result["eta_min"]} min')
                             c3.metric("Hops",       result["hops"])
                             c4.metric("CO₂ Saved", f'{result.get("co2_saving_kg", 0):.3f} kg')
-                            st.success(f"Route: **{' → '.join(result['path'])}**")
+                            src_badge = result.get("data_source", "NetworkX")
+                            if src_badge == "OSRM":
+                                st.success(f"🛰️ **OSRM Real-Time Route**: **{' → '.join(result['path'])}**  |  Actual road geometry used.")
+                            else:
+                                st.success(f"Route [{src_badge}]: **{' → '.join(result['path'])}**")
                             savings = self.business.calculate_carbon_savings(
                                 result.get("traditional_km", result["total_km"] * 1.3),
                                 result["total_km"],
@@ -4977,6 +5428,9 @@ document.getElementById('abcG').innerHTML =
             pd_status   = "Yes" if PANDAS_AVAILABLE else "No"
             bs4_status  = "Yes" if BS4_AVAILABLE else "No (scraping disabled)"
             sdk_status  = "openai SDK" if OPENAI_SDK else ("groq SDK" if GROQ_SDK else "None")
+            pydeck_status   = "Yes" if PYDECK_AVAILABLE else "No (pip install pydeck)"
+            polyline_status = "Yes" if POLYLINE_AVAILABLE else "No (pip install polyline)"
+            geopandas_status = "Yes" if GEOPANDAS_AVAILABLE else "No (pip install geopandas)"
 
             st.markdown(
                 f'<div class="nx-card"><h4>🔧 Runtime</h4><p>'
@@ -4990,6 +5444,9 @@ document.getElementById('abcG').innerHTML =
                 f'NetworkX: <b>{nx_status}</b><br>'
                 f'Pandas: <b>{pd_status}</b><br>'
                 f'BS4 Scraper: <b>{bs4_status}</b><br>'
+                f'PyDeck (3D maps): <b>{pydeck_status}</b><br>'
+                f'Polyline (OSRM): <b>{polyline_status}</b><br>'
+                f'GeoPandas (PIP): <b>{geopandas_status}</b><br>'
                 f'Grok API Key: <b>{"Set" if GROK_API_KEY else "Missing"}</b><br>'
                 f'Scrape TTL: <b>{SCRAPE_TTL}s</b><br>'
                 f'Forecast Horizon: <b>{FORECAST_DAYS} days</b>'
@@ -5020,6 +5477,26 @@ document.getElementById('abcG').innerHTML =
                     [{"hub":h,"lat":c[0],"lon":c[1]} for h,c in DHAKA_HUBS.items()]
                 ), use_container_width=True)
 
+            # ── Zone Analyzer section ─────────────────────────────────────────
+            st.divider()
+            st.markdown("### 🗺️ GIS Zone Analyzer (Point-in-Polygon)")
+            if self.zones:
+                st.markdown(self.zones.zone_summary())
+                st.markdown("**Test PIP lookup:**")
+                pip_col1, pip_col2 = st.columns(2)
+                with pip_col1:
+                    test_lat = st.number_input("Latitude",  value=23.775, format="%.4f", key="pip_lat")
+                    test_lon = st.number_input("Longitude", value=90.408, format="%.4f", key="pip_lon")
+                if st.button("🔍 Find Zone", key="pip_btn"):
+                    zone_hit = self.zones.get_zone(test_lat, test_lon)
+                    hub_hit  = self.zones.assign_nearest_hub(test_lat, test_lon)
+                    if zone_hit:
+                        st.success(f"📍 Point ({test_lat:.4f}, {test_lon:.4f}) is in **{zone_hit}** zone → assigned hub: **{hub_hit}**")
+                    else:
+                        st.warning(f"⚠️ Point outside polygon zones. Nearest hub (Haversine): **{hub_hit}**")
+            else:
+                st.info("ZoneAnalyzer not initialised.")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # BLOCK 8 ── MASTER CONTROLLER
@@ -5039,6 +5516,8 @@ class ApplicationController:
         "business": "__nx_business__",
         "routing":  "__nx_routing__",
         "maps":     "__nx_maps__",
+        "pydeck":   "__nx_pydeck__",
+        "zones":    "__nx_zones__",
         "ui":       "__nx_ui__",
     }
 
@@ -5112,6 +5591,20 @@ class ApplicationController:
             st.session_state[k] = MapRenderer()
         return st.session_state[k]
 
+    def _get_pydeck(self) -> PyDeckRenderer:
+        k = self._SS["pydeck"]
+        if k not in st.session_state:
+            self.logger.info("Init PyDeckRenderer")
+            st.session_state[k] = PyDeckRenderer()
+        return st.session_state[k]
+
+    def _get_zones(self) -> ZoneAnalyzer:
+        k = self._SS["zones"]
+        if k not in st.session_state:
+            self.logger.info("Init ZoneAnalyzer")
+            st.session_state[k] = ZoneAnalyzer()
+        return st.session_state[k]
+
     def _get_ui(self) -> NexusUI:
         k = self._SS["ui"]
         if k not in st.session_state:
@@ -5124,6 +5617,8 @@ class ApplicationController:
                 business = self._get_business(),
                 routing  = self._get_routing(),
                 maps     = self._get_maps(),
+                pydeck   = self._get_pydeck(),
+                zones    = self._get_zones(),
             )
         return st.session_state[k]
 
